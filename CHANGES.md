@@ -96,3 +96,19 @@ less agent-fix.patch
 - CI `package` job 持续验证：dpkg-buildpackage 构建 `.deb` + lintian `--fail-on error` + 产物挂 artifact。
 - tag `v*` 触发 `release.yml`：6 平台二进制 + amd64 `.deb` 自动挂 GitHub Release —— `apt install ./agent-go_*_amd64.deb` 即装即用。
 - 官方 Debian/Ubuntu 仓库需真人维护者走 ITP + 赞助（mentors.debian.net）→ NEW 队列；打包材料已齐备。
+
+---
+
+# v1.3：Debian 包定名 agentlet + 特色描述
+
+## 命名（撞名检索后定案）
+
+- "nano agent" 方向经检索已被同域占用：GitHub `disler/nano-agent`（MCP Server）、PyPI `nano-agent`、HuggingFace NanoAgent-135M —— 对 apt 可见性与 Debian NEW 队列审核均不利。
+- 定名 **agentlet**：agent + -let（piglet / droplet 同构），即 "nano 尺度的 agent"；保留 `agent` 关键词，`apt search agent` 可命中；未发现同域撞名。
+- "nano" 降级为描述词：synopsis `nano-sized terminal AI agent (streaming, tool-calling, zero deps)`。
+
+## debian/ 同步
+
+- Source/Package: `agentlet`，`Upstream-Name: agent-go`；rules 增加 agent-go → agentlet 二进制改名（dh-golang 以模块基名产出）。
+- changelog 重写为 agentlet 0.1.0-1 首包；CI / release 工作流改由 `dpkg-parsechangelog` 派生源包名与版本（后续改名零 CI 改动）。
+- deb 内二进制 `/usr/bin/agentlet`；`go install github.com/dksslq/agent-go@latest` 产物仍为 `agent-go`（模块路径 = 仓库名），README 安装表分列注明。

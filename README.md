@@ -40,8 +40,10 @@
 | 方式 | 说明 |
 |---|---|
 | Go | `go install github.com/dksslq/agent-go@latest`（Go 1.21+，秒级构建） |
-| Debian / Ubuntu | Release 页下载 `.deb` → `apt install ./agent-go_*_amd64.deb`；`debian/` 打包已就绪（dh-golang 规范、CI 持续验证），经 ITP + 赞助人提交后进入官方仓库并自动同步 Ubuntu |
+| Debian / Ubuntu | Release 页下载 `.deb` → `apt install ./agentlet_*_amd64.deb`（**Debian 包名 agentlet**——nano-sized 的终端 agent，二进制 `/usr/bin/agentlet`） |
 | 源码 | `git clone` → `go build -o agent .` |
+
+> 命名：同域检索发现 "nano-agent" 已被占用（GitHub MCP Server / PyPI 同名包），故取 **agentlet**（agent + -let，piglet / droplet 同构）；"nano" 保留为描述词。
 
 **运行**
 

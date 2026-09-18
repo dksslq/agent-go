@@ -60,17 +60,18 @@ jobs:
 
       - name: build .deb
         run: |
+          N=$(dpkg-parsechangelog -S Source)
           V=$(dpkg-parsechangelog -S Version)
-          git archive HEAD --prefix "agent-go-${V%%-*}/" | tar -x -C /tmp
-          tar -C /tmp -czf "/tmp/agent-go_${V%%-*}.orig.tar.gz" "agent-go-${V%%-*}"
-          (cd "/tmp/agent-go-${V%%-*}" && dpkg-buildpackage -us -uc -b)
-          dpkg-deb -I /tmp/agent-go_${V}_amd64.deb
-          dpkg-deb -c /tmp/agent-go_${V}_amd64.deb
+          git archive HEAD --prefix "${N}-${V%%-*}/" | tar -x -C /tmp
+          tar -C /tmp -czf "/tmp/${N}_${V%%-*}.orig.tar.gz" "${N}-${V%%-*}"
+          (cd "/tmp/${N}-${V%%-*}" && dpkg-buildpackage -us -uc -b)
+          dpkg-deb -I /tmp/${N}_${V}_amd64.deb
+          dpkg-deb -c /tmp/${N}_${V}_amd64.deb
 
       - name: lintian
-        run: lintian --fail-on error /tmp/agent-go_*_amd64.deb
+        run: N=$(dpkg-parsechangelog -S Source); lintian --fail-on error /tmp/${N}_*_amd64.deb
 
       - uses: actions/upload-artifact@v4
         with:
-          name: agent-go-deb
-          path: /tmp/agent-go_*_amd64.deb
+          name: agentlet-deb
+          path: /tmp/agentlet_*_amd64.deb

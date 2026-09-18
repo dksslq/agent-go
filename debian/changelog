@@ -1,7 +1,8 @@
-agent-go (0.1.0-1) unstable; urgency=medium
+agentlet (0.1.0-1) unstable; urgency=medium
 
-  * Initial packaging: single-binary terminal AI agent (OpenAI-compatible
-    streaming, exec / image_read / video_read tools, session persistence,
-    raw-mode line editing).
+  * Initial Debian packaging of upstream agent-go (github.com/dksslq/agent-go).
+    Nano-sized terminal AI agent: OpenAI-compatible streaming, tool calling
+    (exec / image_read / video_read), multimodal input, session persistence,
+    raw-mode line editing; pure Go, zero third-party dependencies.
 
- -- dksslq <dksslq@users.noreply.github.com>  Fri, 18 Sep 2026 12:35:58 +0000
+ -- dksslq <dksslq@users.noreply.github.com>  Fri, 18 Sep 2026 12:58:53 +0000

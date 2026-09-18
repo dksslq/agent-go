@@ -1,4 +1,4 @@
-Source: agent-go
+Source: agentlet
 Section: utils
 Priority: optional
 Maintainer: dksslq <dksslq@users.noreply.github.com>
@@ -9,15 +9,16 @@ Rules-Requires-Root: no
 Vcs-Browser: https://github.com/dksslq/agent-go
 Vcs-Git: https://github.com/dksslq/agent-go.git
 XS-Go-Import-Path: github.com/dksslq/agent-go
+Upstream-Name: agent-go
 
-Package: agent-go
+Package: agentlet
 Architecture: any
 Depends: ${misc:Depends}, ${shlibs:Depends}
-Description: single-binary terminal AI agent (OpenAI-compatible streaming)
- agent-go is a minimal terminal AI agent in ~1600 lines of pure Go,
- standard library only, zero third-party dependencies.
- It streams from any OpenAI-compatible chat API, executes tool calls
- (exec, image_read, video_read), accepts multimodal attachments and
- persists sessions to JSON files with raw-mode line editing.
+Description: nano-sized terminal AI agent (streaming, tool-calling, zero deps)
+ agentlet streams answers from any OpenAI-compatible chat API, runs
+ tools (exec, image_read, video_read) in parallel, accepts image and
+ video attachments, and persists sessions as plain JSON — all in
+ ~1600 lines of dependency-free Go, shipped as a single binary.
  .
- This package contains the command-line tool.
+ No config files, no plugins, no telemetry: one file to read, one
+ binary to trust.
