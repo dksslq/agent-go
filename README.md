@@ -35,11 +35,15 @@
 
 ## 🚀 快速开始
 
-```bash
-git clone https://github.com/your-username/agent-go.git
-cd agent-go
-go build -o agent .          # 零依赖，秒级构建
-```
+**安装**
+
+| 方式 | 说明 |
+|---|---|
+| Go | `go install github.com/dksslq/agent-go@latest`（Go 1.21+，秒级构建） |
+| Debian / Ubuntu | Release 页下载 `.deb` → `apt install ./agent-go_*_amd64.deb`；`debian/` 打包已就绪（dh-golang 规范、CI 持续验证），经 ITP + 赞助人提交后进入官方仓库并自动同步 Ubuntu |
+| 源码 | `git clone` → `go build -o agent .` |
+
+**运行**
 
 ```bash
 # 交互模式（-continue 自动续档 + 存档）
@@ -135,9 +139,11 @@ agent-go
 ├── sse_test.go            # 全平台单测：SSE 全链路（httptest）/ 轮次护栏端到端
 ├── pty_readline_test.go   # PTY 输入回归实测（linux only）
 ├── go.mod
+├── debian/                # Debian 打包（dh-golang）：control / rules / changelog / copyright
 ├── docs/demo.svg          # 效果演示
 ├── CHANGES.md             # 修复说明
-└── .github/workflows/ci.yml   # CI：vet + build + PTY test + 6 平台交叉编译
+├── .github/workflows/ci.yml       # CI：vet + build + PTY test + 6 平台交叉编译 + .deb 打包（lintian）
+└── .github/workflows/release.yml  # tag v* → 6 平台二进制 + .deb 自动挂 Release
 ```
 
 ## 🚢 发布到 GitHub

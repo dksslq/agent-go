@@ -80,3 +80,19 @@ less agent-fix.patch
 - `agent_test.go`（全平台）：会话存档 round-trip、ENV 刷新（含自定义 system 保留、非字符串 content 跳过）、提示词结构、管道模式输入解析（转义序列 / 控制字符 / CRLF / EOF）、readMedia（类型 / 大小 / 目录 / 缺失）、wrapResult / 参数解析、sanitize、ANSI 剥离。
 - `sse_test.go`（全平台）：httptest 假端点 SSE 全链路 —— reasoning/content 分流、tool_calls 乱序分片累积、finish 触发与 EOF 兜底、[DONE] 停读、自定义字段映射、坏行跳过、API 错误、断连、ctx 取消、请求形状（含 `-extra` 合并）、工具轮次护栏端到端（assistant 与 tool 严格成对）。
 - `pty_readline_test.go`（linux）：PTY 行编辑回归（保留）。
+
+---
+
+# v1.2：Debian 打包 + `go install` 直装
+
+## go.mod 模块路径规范化
+
+- `module agent` → `module github.com/dksslq/agent-go`：解锁 `go install github.com/dksslq/agent-go@latest` 一行安装，同时是 dh-golang 打包的前提。
+- 纯单包、无内部导入，改名零代码影响。
+
+## debian/ 打包（通往官方仓库的完整材料）
+
+- `debian/control|rules|changelog|copyright|docs|source/format`：dh-golang 规范、quilt 格式、DEP-5 版权、`Rules-Requires-Root: no`。
+- CI `package` job 持续验证：dpkg-buildpackage 构建 `.deb` + lintian `--fail-on error` + 产物挂 artifact。
+- tag `v*` 触发 `release.yml`：6 平台二进制 + amd64 `.deb` 自动挂 GitHub Release —— `apt install ./agent-go_*_amd64.deb` 即装即用。
+- 官方 Debian/Ubuntu 仓库需真人维护者走 ITP + 赞助（mentors.debian.net）→ NEW 队列；打包材料已齐备。

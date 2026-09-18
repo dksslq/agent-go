@@ -1,0 +1,50 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: verify
+        run: go vet ./... && go test -count=1 .
+
+      - name: cross-compile
+        run: |
+          mkdir -p dist
+          for os in linux darwin windows; do
+            for arch in amd64 arm64; do
+              exe=""
+              [ "$os" = windows ] && exe=".exe"
+              CGO_ENABLED=0 GOOS=$os GOARCH=$arch \
+                go build -trimpath -ldflags "-s -w" \
+                -o "dist/agent-go-${os}-${arch}${exe}" .
+            done
+          done
+
+      - name: build .deb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq debhelper dh-golang
+          VER="${GITHUB_REF_NAME#v}"
+          git archive HEAD --prefix "agent-go-${VER}/" | tar -x -C /tmp
+          sed -i "1s/([^)]*)/(${VER}-1)/" "/tmp/agent-go-${VER}/debian/changelog"
+          tar -C /tmp -czf "/tmp/agent-go_${VER}.orig.tar.gz" "agent-go-${VER}"
+          (cd "/tmp/agent-go-${VER}" && dpkg-buildpackage -us -uc -b)
+          cp /tmp/agent-go_${VER}_amd64.deb dist/
+
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes

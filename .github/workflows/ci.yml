@@ -47,3 +47,30 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
         run: go build -o /dev/null .
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq debhelper dh-golang lintian
+
+      - name: build .deb
+        run: |
+          V=$(dpkg-parsechangelog -S Version)
+          git archive HEAD --prefix "agent-go-${V%%-*}/" | tar -x -C /tmp
+          tar -C /tmp -czf "/tmp/agent-go_${V%%-*}.orig.tar.gz" "agent-go-${V%%-*}"
+          (cd "/tmp/agent-go-${V%%-*}" && dpkg-buildpackage -us -uc -b)
+          dpkg-deb -I /tmp/agent-go_${V}_amd64.deb
+          dpkg-deb -c /tmp/agent-go_${V}_amd64.deb
+
+      - name: lintian
+        run: lintian --fail-on error /tmp/agent-go_*_amd64.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-go-deb
+          path: /tmp/agent-go_*_amd64.deb
