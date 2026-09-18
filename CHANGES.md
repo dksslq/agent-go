@@ -64,3 +64,19 @@ go test -v .
 # 查看全部改动
 less agent-fix.patch
 ```
+
+---
+
+# v1.1：会话重载环境值刷新 + 全面单元测试
+
+## 会话重载的过期环境值（设计决策：载入即刷新）
+
+- **问题**：`-load` / `-continue` / `/reload` 载入的 system 消息中 ENV 段（Timestamp / PID / Exe / Vars）描述的是旧进程，重载后含义已失效。
+- **决策**：既不直接舍弃、也不标注过期 —— `loadSession` 在载入时以当前进程**原位刷新 ENV 段**（单一真相源：system 的环境值永远描述当前进程）；规则段原样保留；无 ENV 锚点的自定义 system 消息一字不动。零数据丢失、零新增噪音。
+- **实现**：`buildSystemPrompt` 拆为 `systemRules()` + `systemEnv()`（共用锚点 `systemEnvMarker`）；`loadSession` 尾部 7 行刷新循环，`-load` / `-continue` / `/reload` 三路自动统一。
+
+## 测试套件（32 函数 / 45+ 用例，零测试依赖）
+
+- `agent_test.go`（全平台）：会话存档 round-trip、ENV 刷新（含自定义 system 保留、非字符串 content 跳过）、提示词结构、管道模式输入解析（转义序列 / 控制字符 / CRLF / EOF）、readMedia（类型 / 大小 / 目录 / 缺失）、wrapResult / 参数解析、sanitize、ANSI 剥离。
+- `sse_test.go`（全平台）：httptest 假端点 SSE 全链路 —— reasoning/content 分流、tool_calls 乱序分片累积、finish 触发与 EOF 兜底、[DONE] 停读、自定义字段映射、坏行跳过、API 错误、断连、ctx 取消、请求形状（含 `-extra` 合并）、工具轮次护栏端到端（assistant 与 tool 严格成对）。
+- `pty_readline_test.go`（linux）：PTY 行编辑回归（保留）。

@@ -9,9 +9,10 @@
 [![Go](https://img.shields.io/badge/Go-1.21%2B-00ADD8?logo=go&logoColor=white)](#-快速开始)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#-快速开始)
 [![Deps](https://img.shields.io/badge/third--party%20deps-zero-3fb950)](#-特性)
-[![Tests](https://img.shields.io/badge/PTY%20tests-3%2F3%20pass-3fb950)](#-测试与质量)
+[![Tests](https://img.shields.io/badge/tests-32%20pass%20%C2%B7%200%20test%20deps-3fb950)](#-测试与质量)
 [![License](https://img.shields.io/badge/license-MIT-green)](#-许可)
 [![Designed by](https://img.shields.io/badge/designed%20by-DeepSeek%20%C3%97%20GLM-ff7b72)](#-designed-by-deepseek--glm)
+[![CI](https://github.com/dksslq/agent-go/actions/workflows/ci.yml/badge.svg)](https://github.com/dksslq/agent-go/actions/workflows/ci.yml)
 
 <img src="docs/demo.svg" alt="agent-go 终端演示：流式回复、工具调用、会话持久化" width="820"/>
 
@@ -108,15 +109,15 @@ rg -n 'os\.(Open|Create)' agent.go   # 文件面：只有媒体与会话
 
 ## 🧪 测试与质量
 
-- **编译矩阵**：linux / darwin / windows × amd64 / arm64 全通过，`go vet` 三平台零告警，`gofmt` 干净；
-- **PTY 实测**（`pty_readline_test.go`，真实 `/dev/ptmx` 伪终端 + raw mode 驱动真实 `readLine`）：
-  - `↑` + `Home` + `Delete` + `ok` → 读到 `"ok"`（修复前为 `"[A[H[3~ok"`，转义残片污染输入的 bug 实锤复现）
-  - 纯文本、退格编辑回归通过（`go clean -testcache && go test -count=1` 非缓存复跑）
-- **补丁可信**：`agent-fix.patch`（5 hunk、20 行纯新增）经过 **原始文件 + patch == 修复版** 逐字节往返校验。
+全部测试仅用标准库 `testing` + `httptest`，**零测试依赖**，`go test .` 一条命令全跑：
 
-```bash
-go test -v .        # 仅 Linux，需要 /dev/ptmx；不需要可直接删除该测试文件
-```
+| 套件 | 用例 | 覆盖 | 平台 |
+|---|---|---|---|
+| `agent_test.go` | 16 函数 / 31 用例 | 会话存档 round-trip（多模态 / tool_calls / tool 成对）；空、坏、缺文件；**system ENV 载入即刷新**（PID/时间戳/环境变量更新为当前进程，规则段与自定义 system 原样保留）；提示词结构；转义序列吞除（管道模式）；控制字符；媒体读取（类型 / 大小 / 目录）；工具辅助（wrapResult / 参数解析）；sanitize；ANSI 剥离 | 全平台 |
+| `sse_test.go` | 13 函数 | SSE 全链路（httptest 假端点）：reasoning / content 分流；tool_calls 乱序分片累积、finish 触发与 EOF 兜底、`[DONE]` 停读；自定义字段映射；坏行跳过；API 错误；断连；ctx 取消；请求形状（model / tools / auth / `-extra` 合并）；**工具轮次护栏端到端**（assistant 与 tool 消息严格成对） | 全平台 |
+| `pty_readline_test.go` | 3 用例 | 真实 `/dev/ptmx` 伪终端 + raw mode 驱动真实 `readLine`：方向键 / Home / Delete 不污染输入、纯文本、退格编辑 | linux |
+
+平台差异几乎只有终端特性：输入解析、流解析、会话、工具辅助均在纯管道层验证（全平台），仅终端行编辑需 PTY 实测（linux）。
 
 历史改动详见 [CHANGES.md](CHANGES.md)，最小修复补丁见 [agent-fix.patch](agent-fix.patch)。
 
@@ -130,6 +131,8 @@ agent-go
 ├── term_windows.go
 ├── exec_unix.go           # 平台适配：进程组（Unix）/ Windows 空实现
 ├── exec_windows.go
+├── agent_test.go          # 全平台单测：会话 / 提示词刷新 / 输入 / 媒体 / 工具辅助
+├── sse_test.go            # 全平台单测：SSE 全链路（httptest）/ 轮次护栏端到端
 ├── pty_readline_test.go   # PTY 输入回归实测（linux only）
 ├── go.mod
 ├── docs/demo.svg          # 效果演示
@@ -148,11 +151,7 @@ git remote add origin git@github.com:<your-username>/agent-go.git
 git push -u origin main
 ```
 
-push 后把下面这行加回 README 顶部徽章区，CI 状态徽章即自动点亮（`.github/workflows/ci.yml` 已内置 vet + build + PTY 实测 + 6 平台交叉编译）：
-
-```markdown
-[![CI](https://github.com/<your-username>/agent-go/actions/workflows/ci.yml/badge.svg)](https://github.com/<your-username>/agent-go/actions/workflows/ci.yml)
-```
+CI 徽章已指向 `dksslq/agent-go`，fork 后把 README 顶部的仓库名改为你自己的即可。
 
 ## 🧬 Designed by DeepSeek × GLM
 
