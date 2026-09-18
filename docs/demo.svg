@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="534" viewBox="0 0 820 534" font-family="'JetBrains Mono','Fira Code','SF Mono',Consolas,'Liberation Mono',Menlo,monospace,'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Noto Sans CJK SC',sans-serif" font-size="13">
+  <!-- window -->
+  <rect x="6" y="6" width="808" height="522" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
+  <!-- title bar -->
+  <path d="M 6 16 a 10 10 0 0 1 10 -10 h 788 a 10 10 0 0 1 10 10 v 28 h -808 z" fill="#161b22"/>
+  <line x1="6" y1="44" x2="814" y2="44" stroke="#21262d" stroke-width="1"/>
+  <circle cx="32" cy="27" r="6" fill="#ff5f56"/>
+  <circle cx="54" cy="27" r="6" fill="#ffbd2e"/>
+  <circle cx="76" cy="27" r="6" fill="#27c93f"/>
+  <text x="410" y="31" text-anchor="middle" fill="#8b949e" font-size="12">agent — zsh — 80×24</text>
+
+  <!-- r1: launch -->
+  <text x="34" y="78"><tspan fill="#8b949e">$ </tspan><tspan fill="#e6edf3">./agent -model glm-4.7 -api-base https://api.z.ai/api/paas/v4 -continue dev.session</tspan></text>
+  <!-- r2 -->
+  <text x="34" y="98" fill="#8b949e">Auto-save enabled: dev.session</text>
+  <!-- r3 -->
+  <text x="34" y="118" fill="#8b949e">Agent started. Type 'exit' to quit. Type '/help' for commands.</text>
+  <!-- r4 blank -->
+  <!-- r5 user prompt -->
+  <text x="34" y="158"><tspan fill="#7ee787" font-weight="bold">&gt; </tspan><tspan fill="#e6edf3">统计当前目录所有 Go 文件的代码行数，做一份汇总</tspan></text>
+  <!-- r6 tool_calls intent -->
+  <text x="34" y="178"><tspan fill="#ffa657">[tool_calls] </tspan><tspan fill="#8b949e">[{"function":{"name":"exec","arguments":"{…}"}}]</tspan></text>
+  <!-- r7 -->
+  <text x="34" y="198" fill="#8b949e" font-style="italic">Tools detected, executing...</text>
+  <!-- r8 -->
+  <text x="34" y="218" fill="#ffa657">[tool: exec]</text>
+  <!-- r9 arguments -->
+  <text x="34" y="238" fill="#8b949e">{"program":"wc","args":["-l","*.go"],"input":"","timeout_seconds":10}</text>
+  <!-- r10 -->
+  <text x="34" y="258" fill="#8b949e">[result]</text>
+  <!-- r11..r17 wc output -->
+  <text x="34" y="278" fill="#e6edf3">   1596 agent.go</text>
+  <text x="34" y="298" fill="#e6edf3">     13 exec_unix.go</text>
+  <text x="34" y="318" fill="#e6edf3">     10 exec_windows.go</text>
+  <text x="34" y="338" fill="#e6edf3">     90 pty_readline_test.go</text>
+  <text x="34" y="358" fill="#e6edf3">     35 term_darwin.go</text>
+  <text x="34" y="378" fill="#e6edf3">     35 term_linux.go</text>
+  <text x="34" y="398" fill="#e6edf3">     44 term_windows.go</text>
+  <!-- r18 total -->
+  <text x="34" y="418" fill="#e6edf3" font-weight="bold">   1823 total</text>
+  <!-- r19 blank -->
+  <!-- r20 assistant reply (streamed) -->
+  <text x="34" y="458" fill="#e6edf3">当前目录共 7 个 Go 文件、1823 行：核心逻辑集中在 agent.go（1596 行），其余是平台适配的薄壳。</text>
+  <!-- r21 blank -->
+  <!-- r22 idle prompt with blinking cursor -->
+  <text x="34" y="498" fill="#7ee787" font-weight="bold">&gt; </text>
+  <rect x="54" y="486" width="8" height="16" fill="#7ee787">
+    <animate attributeName="opacity" values="1;1;0;0" keyTimes="0;0.5;0.5;1" calcMode="discrete" dur="1.15s" repeatCount="indefinite"/>
+  </rect>
+</svg>

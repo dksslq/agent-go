@@ -1,0 +1,57 @@
+--- a/agent.go
++++ b/agent.go
+@@ -40,6 +40,7 @@
+ 
+ 	maxFileBytes       int64
+ 	maxExecOutputChars int
++	maxToolRounds      int
+ 
+ 	httpMaxIdleConns    int
+ 	httpIdleTimeout     time.Duration
+@@ -957,6 +958,7 @@
+ }
+ 
+ func runInferenceLoop(ctx context.Context, messages *[]Message) error {
++	rounds := 0
+ 	for {
+ 		eventCh, streamCancel, err := chatStream(ctx, *messages)
+ 		if err != nil {
+@@ -1071,6 +1073,13 @@
+ 			recordTurnAbort(messages, "", nil, interruptedMarker)
+ 			return ctx.Err()
+ 		}
++		rounds++
++		if maxToolRounds > 0 && rounds >= maxToolRounds {
++			marker := fmt.Sprintf("[Tool round limit reached: %d]", maxToolRounds)
++			putf("\n%s\n", marker)
++			*messages = append(*messages, Message{Role: "assistant", Content: marker})
++			return nil
++		}
+ 	}
+ }
+ 
+@@ -1137,6 +1146,16 @@
+ 					put("\b \b")
+ 				}
+ 			}
++		} else if r == 27 { // ESC：吞掉整个终端转义序列（方向键/Home/End/Delete 等），防止残留字符混入输入
++			// 序列以 ESC [ 或 ESC O 开头、字母或 '~' 结束；孤立 Esc 会吞掉下一个按键（与 kilo 等极简实现一致）
++			if next, _, err := reader.ReadRune(); err == nil && (next == '[' || next == 'O') {
++				for {
++					nr, _, err := reader.ReadRune()
++					if err != nil || (nr >= 'A' && nr <= 'Z') || (nr >= 'a' && nr <= 'z') || nr == '~' {
++						break
++					}
++				}
++			}
+ 		} else if r >= 32 || r == '\t' {
+ 			line.WriteRune(r)
+ 			if termRaw {
+@@ -1290,6 +1309,7 @@
+ 
+ 	flag.Int64Var(&maxFileBytes, "max-file-bytes", 0, "Maximum media file size in bytes (0 = unlimited)")
+ 	flag.IntVar(&maxExecOutputChars, "max-exec-output-chars", 0, "Default exec output char limit (0 = unlimited)")
++	flag.IntVar(&maxToolRounds, "max-tool-rounds", 25, "Max tool-call rounds per user turn (0 = unlimited)")
+ 
+ 	flag.IntVar(&httpMaxIdleConns, "http-max-idle-conns", 1000, "Maximum idle HTTP connections")
+ 	flag.DurationVar(&httpIdleTimeout, "http-idle-timeout", 5*time.Minute, "HTTP idle connection timeout")

@@ -1,0 +1,11 @@
+# build artifacts
+/agent
+/agent.exe
+/dist/
+
+# session archives
+*.session
+
+# editor
+.idea/
+.vscode/

@@ -1,0 +1,66 @@
+# agent-go 修复包
+
+基于您上传的 6 个源文件制作。**仅 `agent.go` 有改动**，其余 5 个文件与原始上传逐字节一致。
+
+## 改动 1：修复方向键/编辑键污染输入（实测复现的 bug）
+
+**现象**（已用 `/dev/ptmx` 真实伪终端 + raw 模式运行真实 `readLine` 复现）：
+按 `↑` / `Home` / `Delete` 后输入 `ok` 回车，程序读到的输入行是 `"[A[H[3~ok"` —— ESC 转义序列残片全部混入输入并发送给模型。
+
+**修复**：`readLine` 新增 `r == 27` 分支，吞掉以 `ESC [` 或 `ESC O` 开头、至字母或 `~` 结束的整个转义序列（10 行，含注释）。孤立按 Esc 会吞掉紧随的一个按键，与 kilo 等极简实现的行为一致。
+
+**修复后实测**：`↑` + `Home` + `Delete` + `ok` → 读到 `"ok"`；纯文本 `"hello"` → `"hello"`；`ab` + 退格 + `c` → `"ac"`（后两项为无回归证明）。
+
+## 改动 2：新增 `-max-tool-rounds`（工具循环轮次上限）
+
+**标准依据**：主流 agent 运行时均内置每轮工具循环上限 —— OpenAI Agents SDK 默认 `max_turns=10`，LangChain 默认 `max_iterations=15`。
+
+**实现**（最小化：1 个变量 + 1 个 flag + 6 行守卫）：
+- 默认 `25`，`0` = 不限制（与本文件其他 limit 约定一致）；
+- 在每轮工具**执行完毕后**检查，保证 assistant(tool_calls) 与 tool 消息永远成对，历史不会残缺；
+- 达到上限时向会话注入 `[Tool round limit reached: N]` 并正常结束本轮（非报错路径）。
+
+## 补丁文件
+
+`agent-fix.patch` 为相对原始文件的 unified diff：**5 个 hunk、全部为新增行（共 20 行）**，无任何删改。
+应用方式：`patch -p0 < agent-fix.patch` 或 `git apply agent-fix.patch`。
+（该补丁已经过往返校验：原始文件 + 补丁 == 修复版，逐字节一致。）
+
+## 验证矩阵（Go 1.27.1）
+
+- 编译：linux / darwin(amd64, arm64) / windows(amd64, arm64) **全部通过**
+- `go vet`：3 个 GOOS 零告警；`gofmt` 干净
+- PTY 实测：3/3 通过（`go clean -testcache && go test` 非缓存复跑）
+
+## 约束核查（未改动，原代码已满足）
+
+- 网络请求：仅 `chatStream` 访问模型 API（`apiBase+"/chat/completions"`），无其他网络调用；
+- 文件读写：仅工具用 `readMedia`、会话存档 `saveSession`/`loadSession`。
+
+## 文件清单
+
+| 文件 | 说明 |
+|---|---|
+| agent.go | 修复版（含上述 2 处改动） |
+| exec_unix.go | 原样（unix 进程组设置） |
+| exec_windows.go | 原样（Windows 空实现） |
+| term_darwin.go | 原样（macOS raw mode） |
+| term_linux.go | 原样（Linux raw mode） |
+| term_windows.go | 原样（Windows console） |
+| pty_readline_test.go | 输入回归实测用例（`//go:build linux`，不影响 `go build`，不需要可删除） |
+| go.mod | 仅便于就地 `go build` / `go test`，并入您自己的模块时可忽略 |
+| agent-fix.patch | 修复补丁 |
+| CHANGES.md | 本说明 |
+
+## 快速使用
+
+```bash
+# 直接构建
+go build -o agent .
+
+# 复跑输入实测（仅 Linux，需要 /dev/ptmx）
+go test -v .
+
+# 查看全部改动
+less agent-fix.patch
+```
