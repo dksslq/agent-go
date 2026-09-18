@@ -56,7 +56,7 @@ jobs:
       - name: install build tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq debhelper dh-golang lintian
+          sudo apt-get install -y -qq build-essential golang-any debhelper dh-golang lintian
 
       - name: build .deb
         run: |

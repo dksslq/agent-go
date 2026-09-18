@@ -36,7 +36,7 @@ jobs:
       - name: build .deb
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq debhelper dh-golang
+          sudo apt-get install -y -qq build-essential golang-any debhelper dh-golang
           VER="${GITHUB_REF_NAME#v}"
           git archive HEAD --prefix "agent-go-${VER}/" | tar -x -C /tmp
           sed -i "1s/([^)]*)/(${VER}-1)/" "/tmp/agent-go-${VER}/debian/changelog"
