@@ -2,14 +2,17 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---------- sanitize / ansiRegex ----------
@@ -274,5 +277,218 @@ func TestLoadSessionNonStringSystemSkipped(t *testing.T) {
 	}
 	if got[0].Content != nil || got[1].Content == nil {
 		t.Fatalf("non-string system content must pass through untouched: %#v", got)
+	}
+}
+
+func TestSaveSessionBadPath(t *testing.T) {
+	if err := saveSession(filepath.Join(t.TempDir(), "no-such-dir", "s.json"), nil); err == nil {
+		t.Fatal("expected save error for bad path")
+	}
+}
+
+// ---------- pipe prompt (autonomous stdin mode) ----------
+
+func TestPipePrompt(t *testing.T) {
+	cases := []struct{ name, prompt, stdin, want string }{
+		{"stdin only", "", "hello world\n", "hello world"},
+		{"prompt only", "do it", "", "do it"},
+		{"combined", "do it", "data payload\n", "do it\n\ndata payload"},
+		{"both empty", "", "  \n\t", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := pipePrompt(c.prompt, strings.NewReader(c.stdin))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != c.want {
+				t.Fatalf("got %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// ---------- exec: real process end-to-end (unix; windows has no /bin/sh) ----------
+
+func TestExecCmdReal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh-based exec tests are unix-only")
+	}
+	ctx := context.Background()
+
+	t.Run("stdout and stderr captured", func(t *testing.T) {
+		out := execCmd(ctx, "sh", []string{"-c", "echo out; echo err 1>&2"}, "", time.Second, 0, "", nil, false)
+		if !strings.Contains(out, "out") || !strings.Contains(out, "err") {
+			t.Fatalf("combined output lost: %q", out)
+		}
+	})
+	t.Run("stdin injection", func(t *testing.T) {
+		out := execCmd(ctx, "sh", []string{"-c", "read line; echo got:$line"}, "abc\n", time.Second, 0, "", nil, false)
+		if !strings.Contains(out, "got:abc") {
+			t.Fatalf("stdin not delivered: %q", out)
+		}
+	})
+	t.Run("timeout kills", func(t *testing.T) {
+		out := execCmd(ctx, "sh", []string{"-c", "sleep 5"}, "", 300*time.Millisecond, 0, "", nil, false)
+		if !strings.Contains(out, "timed out") {
+			t.Fatalf("timeout not reported: %q", out)
+		}
+	})
+	t.Run("output truncation", func(t *testing.T) {
+		out := execCmd(ctx, "sh", []string{"-c", "seq 1 30000"}, "", time.Second, 100, "", nil, false)
+		if !strings.Contains(out, "[truncated]") || len(out) > 200 {
+			t.Fatalf("truncation not applied: %d bytes", len(out))
+		}
+	})
+	t.Run("cwd", func(t *testing.T) {
+		dir := t.TempDir()
+		out := execCmd(ctx, "sh", []string{"-c", "pwd"}, "", time.Second, 0, dir, nil, false)
+		if !strings.Contains(out, filepath.Base(dir)) {
+			t.Fatalf("cwd not applied: %q", out)
+		}
+	})
+	t.Run("environ injection", func(t *testing.T) {
+		out := execCmd(ctx, "sh", []string{"-c", "echo $AGENTLET_TEST_VAR"}, "", time.Second, 0, "", map[string]string{"AGENTLET_TEST_VAR": "xyz"}, false)
+		if !strings.Contains(out, "xyz") {
+			t.Fatalf("environ not applied: %q", out)
+		}
+	})
+	t.Run("nonzero exit reported", func(t *testing.T) {
+		out := execCmd(ctx, "sh", []string{"-c", "echo boom; exit 3"}, "", time.Second, 0, "", nil, false)
+		if !strings.Contains(out, "boom") || !strings.Contains(out, "Error:") {
+			t.Fatalf("exit error not reported: %q", out)
+		}
+	})
+	t.Run("detach", func(t *testing.T) {
+		out := execCmd(ctx, "sh", []string{"-c", "exit 0"}, "", time.Second, 0, "", nil, true)
+		if !strings.Contains(out, "detached") {
+			t.Fatalf("detach not reported: %q", out)
+		}
+	})
+}
+
+// ---------- runTool dispatch & exec parameter handling ----------
+
+func TestRunToolErrors(t *testing.T) {
+	ctx := context.Background()
+	r, _ := runTool(ctx, "nope", "{}")
+	if !strings.Contains(r, "Unknown tool: nope") {
+		t.Fatalf("unknown tool: %q", r)
+	}
+	r, _ = runTool(ctx, "exec", "not-json")
+	if !strings.Contains(r, "Invalid arguments JSON") {
+		t.Fatalf("bad json: %q", r)
+	}
+	r, _ = runTool(ctx, "exec", `{"program":""}`)
+	if !strings.Contains(r, "program is required") {
+		t.Fatalf("missing program: %q", r)
+	}
+	r, _ = runTool(ctx, "exec", `{"program":"echo","args":[1]}`)
+	if !strings.Contains(r, "all args elements must be strings") {
+		t.Fatalf("bad args: %q", r)
+	}
+	r, _ = runTool(ctx, "exec", `{"program":"echo"}`)
+	if !strings.Contains(r, "timeout_seconds is required") {
+		t.Fatalf("missing timeout: %q", r)
+	}
+}
+
+func TestRunToolExecFlags(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh-based exec tests are unix-only")
+	}
+	ctx := context.Background()
+
+	r, _ := runTool(ctx, "exec", `{"program":"echo","args":["\"hi there\""],"unquote_arguments":true,"timeout_seconds":5}`)
+	var tr ToolResult
+	if err := json.Unmarshal([]byte(r), &tr); err != nil {
+		t.Fatal(err)
+	}
+	if tr.Result != "hi there\n" {
+		t.Fatalf("unquote_arguments not applied: %q", tr.Result)
+	}
+
+	r, _ = runTool(ctx, "exec", `{"program":"echo","args":["quoted"],"quote_result":true,"timeout_seconds":5}`)
+	if err := json.Unmarshal([]byte(r), &tr); err != nil {
+		t.Fatal(err)
+	}
+	if tr.Result != strconv.Quote("quoted\n") {
+		t.Fatalf("quote_result not applied: %q", tr.Result)
+	}
+}
+
+// ---------- misc param helpers ----------
+
+func TestParseExecParams(t *testing.T) {
+	d, err := parseTimeout(map[string]interface{}{"timeout_seconds": float64(3)})
+	if err != nil || d != 3*time.Second {
+		t.Fatalf("timeout: %v %v", d, err)
+	}
+	if _, err := parseTimeout(map[string]interface{}{}); err == nil {
+		t.Fatal("missing timeout must error")
+	}
+	if _, err := parseTimeout(map[string]interface{}{"timeout_seconds": float64(-1)}); err == nil {
+		t.Fatal("negative timeout must error")
+	}
+	if _, err := parseTimeout(map[string]interface{}{"timeout_seconds": "3"}); err == nil {
+		t.Fatal("string timeout must error")
+	}
+
+	env := parseEnvFromParams(map[string]interface{}{"environ": map[string]interface{}{"A": "1", "B": float64(2)}})
+	if env["A"] != "1" || len(env) != 1 {
+		t.Fatalf("environ: %v", env)
+	}
+	if parseEnvFromParams(map[string]interface{}{}) != nil {
+		t.Fatal("missing environ must be nil")
+	}
+
+	if got := buildCmdEnv(nil); got != nil {
+		t.Fatal("empty environ must be nil")
+	}
+}
+
+func TestUnquoteAllStrings(t *testing.T) {
+	in := map[string]interface{}{"a": `"x"`, "list": []interface{}{"\"y\"", float64(3)}, "keep": "plain"}
+	out, ok := unquoteAllStrings(in).(map[string]interface{})
+	if !ok {
+		t.Fatalf("map type lost: %#v", out)
+	}
+	list := out["list"].([]interface{})
+	if out["a"] != "x" || list[0] != "y" || list[1] != float64(3) || out["keep"] != "plain" {
+		t.Fatalf("unquote: %#v", out)
+	}
+}
+
+func TestTruncateText(t *testing.T) {
+	if got := truncateText("hello", 0); got != "hello" {
+		t.Fatalf("0 limit: %q", got)
+	}
+	if got := truncateText("hello", 5); got != "hello" {
+		t.Fatalf("exact: %q", got)
+	}
+	if got := truncateText("hello世界", 6); got != "hello世\n...[truncated]" {
+		t.Fatalf("rune boundary cut: %q", got)
+	}
+}
+
+// ---------- user message assembly ----------
+
+func TestBuildUserMessage(t *testing.T) {
+	m := buildUserMessage("hi", &pendingState{})
+	if m.Content != "hi" {
+		t.Fatalf("plain text: %#v", m)
+	}
+	p := &pendingState{
+		images: []ContentBlock{{Type: "image_url", ImageURL: &ImageURL{URL: "data:img"}}},
+		videos: []ContentBlock{{Type: "video_url", VideoURL: &VideoURL{URL: "data:vid"}}},
+	}
+	m = buildUserMessage("look", p)
+	blocks, ok := m.Content.([]ContentBlock)
+	if !ok || len(blocks) != 3 || blocks[0].Text != "look" || blocks[1].ImageURL == nil || blocks[2].VideoURL == nil {
+		t.Fatalf("media block order: %#v", blocks)
+	}
+	m = buildUserMessage("", p)
+	if blocks = m.Content.([]ContentBlock); len(blocks) != 2 {
+		t.Fatalf("empty text must drop text block: %#v", blocks)
 	}
 }

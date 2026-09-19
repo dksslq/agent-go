@@ -9,7 +9,7 @@
 [![Go](https://img.shields.io/badge/Go-1.21%2B-00ADD8?logo=go&logoColor=white)](#-快速开始)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#-快速开始)
 [![Deps](https://img.shields.io/badge/third--party%20deps-zero-3fb950)](#-特性)
-[![Tests](https://img.shields.io/badge/tests-30%20pass%20%C2%B7%200%20test%20deps-3fb950)](#-测试与质量)
+[![Tests](https://img.shields.io/badge/tests-39%20pass%20%C2%B7%200%20test%20deps-3fb950)](#-测试与质量)
 [![License](https://img.shields.io/badge/license-MIT-green)](#-许可)
 [![Designed by](https://img.shields.io/badge/designed%20by-DeepSeek%20%C3%97%20GLM-ff7b72)](#-designed-by-deepseek--glm)
 [![CI](https://github.com/dksslq/agent-go/actions/workflows/ci.yml/badge.svg)](https://github.com/dksslq/agent-go/actions/workflows/ci.yml)
@@ -30,6 +30,7 @@
 | 🖼 **多模态** | `/image` `/image-url` `/video` `/video-url` 附件随下一条消息发送——让模型"看得见图、看得了视频" |
 | 💾 **会话持久化** | `-save` / `-load` / `-continue` 一键续聊，`/save` `/reload` 在线切换；每轮结束自动存档，对话历史永不丢 |
 | ⌨️ **终端原生** | raw mode 行内编辑（退格即见即所得）；**Ctrl+C 中断当前推理轮、再按退出**；转义序列安全吞除——方向键 / Home / Delete 不会污染输入（有 PTY 实测背书） |
+| 🤖 **全自主可编排** | 人机模式与全自主模式同一二进制：`-once` 内联一句话，`-pipe` 让 stdin 成为数据流——stdin 进、stdout 出、处理完即退、退出码可编排；**并发就是 N 个 OS 进程**，xargs / cron / systemd 任意编排 |
 | 🛡 **防御性默认** | `-max-tool-rounds` 工具轮次护栏（默认 25，对齐 OpenAI Agents SDK / LangChain 惯例）、工具流空闲超时、媒体体积上限、panic 恢复并自动还原终端状态 |
 | 🔌 **即插即用** | 直连任何 **OpenAI 兼容 API**（GLM / DeepSeek / OpenAI / vLLM / Ollama…）；`-extra` 以 Base64 注入任意 JSON 请求字段，厂商私有参数全兼容 |
 
@@ -48,6 +49,35 @@
 | 网络 | 防火墙收敛出站（程序自身只需访问模型 API 一条） |
 
 > 把 agentlet 当作 shell 的等价物：它不是玩具，也不要让它接触不可信来源的输入。
+
+## 🤖 自主模式与并发生产
+
+同一二进制，两种形态：
+
+| 形态 | 入口 | 特征 |
+|---|---|---|
+| **人机协作** | 直接运行 | raw mode 交互、Ctrl+C 中断、`/` 命令、会话续聊 |
+| **全自主** | `-once` / `-pipe` | 无终端假设：stdin 进、stdout 出、处理完即退、退出码可编排 |
+
+`-pipe` 让 agentlet 成为标准 Unix 过滤器——`-prompt` 是指令，stdin 是数据：
+
+```bash
+# 日志分析：stdin 为数据，-prompt 为指令
+cat error.log | agentlet -model glm-4.7 -api-base … -api-key … -pipe -prompt "定位根因，给出修复命令"
+
+agentlet … -pipe < task.md > result.md
+```
+
+**并发就是进程**，刻意不内置线程池与队列：N 个 agentlet = N 个 OS 进程，交给久经考验的 Unix 编排器，无共享状态、无锁、崩溃互不传染——
+
+```bash
+# 100 个任务、8 路并行，每路一个自治 agent
+ls tasks/*.md | xargs -P 8 -I{} sh -c 'agentlet … -pipe < {} > {}.out'
+```
+
+适合放进去的场景：**cron / CI 步骤 / systemd timer 里的自治工人**，**工业内网数据管道的加工工序**，**xargs · make -j 式批量并行分片**。配合 `-continue` 断点续跑；配合逐字节恒定的系统提示词吃满模型端前缀缓存——大规模并发运行的计费最优解。
+
+> 人机模式让人掌舵，自主模式让机器干活——并发与容错交给操作系统，这是 Unix 的做法。
 
 ## 🚀 快速开始
 
@@ -74,6 +104,11 @@
 ./agent -model glm-4.7 -api-base https://api.z.ai/api/paas/v4 \
         -api-key "$ZAI_API_KEY" \
         -prompt "用一句话介绍你自己" -once
+
+# 全自主管道：-prompt 为指令，stdin 为数据，处理完即退
+cat error.log | ./agent -model glm-4.7 -api-base https://api.z.ai/api/paas/v4 \
+        -api-key "$ZAI_API_KEY" \
+        -pipe -prompt "定位根因，给出修复命令"
 ```
 
 ## ⌨️ 交互命令与按键
@@ -109,6 +144,7 @@
 | `-api-base` | `http://localhost:8080/v1` | OpenAI 兼容 API 地址 |
 | `-api-key` | 空 | API Key |
 | `-prompt` / `-once` | — | 非交互单问；`-once` 处理完即退 |
+| `-pipe` | — | 读取 stdin 至 EOF 作为提示词内容；与 `-prompt` 组合（指令 + 空行 + 数据）；隐含 `-once` |
 | `-load` / `-save` / `-continue` | — | 启动载入 / 逐轮自动存档 / 续聊（同一文件自动双向） |
 | `-reasoning-field` `-content-field` `-tool-calls-field` `-finish-reason-field` | `reasoning_content` 等 | 流式 delta 字段名映射，适配不同厂商 |
 | `-max-tool-rounds` | `25` | 每轮用户输入的工具循环上限（`0` 不限；对齐主流 Agent 框架惯例） |
@@ -135,11 +171,11 @@ rg -n 'os\.(Open|Create)' agent.go   # 文件面：只有媒体与会话
 
 | 套件 | 用例 | 覆盖 | 平台 |
 |---|---|---|---|
-| `agent_test.go` | 14 函数 / 29 用例 | 会话存档 round-trip（多模态 / tool_calls / tool 成对）；空、坏、缺文件；**系统提示词完全静态——ENV / TZ / OS / 时间戳 / PID / 变量一律不进提示词（跨运行逐字节恒定，前缀缓存天然全命中），环境按需 `exec` 实时探测**；转义序列吞除（管道模式）；控制字符；媒体读取（类型 / 大小 / 目录）；工具辅助（wrapResult / 参数解析）；sanitize；ANSI 剥离 | 全平台 |
+| `agent_test.go` | 23 函数 / 50 用例 | 会话存档 round-trip（多模态 / tool_calls / tool 成对）；空、坏、缺、坏路径文件；**系统提示词完全静态——ENV / TZ / OS / 时间戳 / PID / 变量一律不进提示词（跨运行逐字节恒定，前缀缓存天然全命中），环境按需 `exec` 实时探测**；`-pipe` 语义（指令 × stdin 组合）；**execCmd 真实进程端到端**（stdout+stderr 合流 / stdin 注入 / 超时击杀 / 输出截断 / cwd / environ / 非零退出 / detach，unix）；runTool 分发与参数错误路径；unquote_arguments / quote_result 端到端；参数解析（timeout / environ / buildCmdEnv / unquote 递归 / rune 边界截断）；用户消息组装（媒体块顺序）；转义序列吞除（管道模式）；控制字符；媒体读取；sanitize；ANSI 剥离 | 全平台* |
 | `sse_test.go` | 13 函数 | SSE 全链路（httptest 假端点）：reasoning / content 分流；tool_calls 乱序分片累积、finish 触发与 EOF 兜底、`[DONE]` 停读；自定义字段映射；坏行跳过；API 错误；断连；ctx 取消；请求形状（model / tools / auth / `-extra` 合并）；**工具轮次护栏端到端**（assistant 与 tool 消息严格成对） | 全平台 |
 | `pty_readline_test.go` | 3 用例 | 真实 `/dev/ptmx` 伪终端 + raw mode 驱动真实 `readLine`：方向键 / Home / Delete 不污染输入、纯文本、退格编辑 | linux |
 
-平台差异几乎只有终端特性：输入解析、流解析、会话、工具辅助均在纯管道层验证（全平台），仅终端行编辑需 PTY 实测（linux）。
+平台差异几乎只有终端特性：输入解析、流解析、会话、工具辅助均在纯管道层验证（全平台），仅终端行编辑需 PTY 实测（linux）。*exec 真实进程用例（`sh`）在 windows 上自动跳过，其余全平台。
 
 历史改动详见 [CHANGES.md](CHANGES.md)，最小修复补丁见 [agent-fix.patch](agent-fix.patch)。
 

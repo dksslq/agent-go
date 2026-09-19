@@ -137,3 +137,28 @@ less agent-fix.patch
 - 系统提示词收敛为纯 `systemRules()`：9 条规则，与运行环境零关联，跨运行 / 跨机器 / 跨会话逐字节恒定，前缀缓存天然全命中。
 - 死代码级联清理：`systemEnv` / `systemEnvMarker` / `refreshSystemEnv` / `buildSystemPrompt` 整体删除；`loadSession` 载入刷新循环删除（会话文件即存即载，无隐藏改写）。
 - 测试守卫改为正向不变量：系统提示词禁含 `ENV:` / `TZ:` / `OS:` / `Exe:` / `Timestamp:` / `PID:` / `Vars:` / `PATH=` 任何环境痕迹。
+
+---
+
+# v1.6：-pipe 全自主模式 + 全面单测 + 内存审计
+
+## -pipe：stdin 即数据，agent 成为 Unix 过滤器
+
+- 新 flag `-pipe`：读取 stdin 至 EOF 作为提示词内容；与 `-prompt` 组合（`-prompt`=指令、stdin=数据，空行拼接，任一可缺省）；隐含 `-once`，处理完即退，退出码可编排。stdin 为空且无 `-prompt` 时显式报错退出，不静默空转。
+- 与 `-once` 的分工：`-once` 是内联一句话；`-pipe` 是让数据流过 agent——`cat x | agentlet -pipe`、`agentlet -pipe < task.md > out.md`、`xargs -P` 并行分片。
+- 并发哲学：不内置线程池 / 队列——并发 = N 个 OS 进程，由 Unix 编排（xargs / cron / systemd timer），无共享状态、无锁、崩溃互不传染；人机模式与全自主模式共用同一二进制。
+- 实现：`pipePrompt(prompt, stdin io.Reader)` 纯函数 + main 内 12 行接线；端到端实测（假 OpenAI SSE 端点）：服务端收到的 prompt 恰为 `指令\n\n数据`，流式答案出 stdout，exit 0。
+
+## 全面单测补齐（30 → 39 函数 / 39+27 用例）
+
+- 新增 9 个测试函数：`TestPipePrompt`（4 子用例：仅 stdin / 仅 prompt / 组合 / 双空）；**`TestExecCmdReal` 真实进程端到端**（stdout+stderr 合流、stdin 注入、超时击杀、输出截断、cwd、environ 注入、非零退出报告、detach——unix，windows 自动跳过）；`TestRunToolErrors`（未知工具 / 坏 JSON / 缺 program / args 类型错误 / 缺 timeout）；`TestRunToolExecFlags`（unquote_arguments / quote_result 端到端）；`TestParseExecParams`（timeout 合法 / 缺失 / 负数 / 字符串，environ 过滤非字符串值，buildCmdEnv 空入参）；`TestUnquoteAllStrings`（递归切片 + 保失败原文 + 非字符串不动）；`TestTruncateText`（0 限 / 恰等 / rune 边界截断）；`TestBuildUserMessage`（纯文本 / 文本→图片→视频块序 / 空文本去块）；`TestSaveSessionBadPath`。
+- 守卫原则不变：不 mock 真实行为——exec 用例驱动真实 `/bin/sh` 进程。
+
+## 内存审计（约束：无积压、申请释放匹配、无 map-delete 陷阱）
+
+- **全库唯一 `delete()`**：`runTool` 对每次调用新建的 params map 删除 2 个控制键——短生命周期对象整体 GC，delete 不承担释放职责，无陷阱；
+- **累积面仅 `messages`**（上下文，设计使然）；chatStream 的 `pendingTools` / `toolIndexMap` 均为流式 goroutine 局部变量，随请求消亡；
+- **Close 全路径配对**：os.Pipe 两端（超时路径 `pr.Close()` 解除 `io.Copy` 阻塞，goroutine 无泄漏）、readMedia 文件、resp.Body（错误 / 非 200 / defer 三路）；
+- **goroutine 有界且全有退出条件**（exec 写读双协程、并行工具 WaitGroup、SSE 读循环、信号处理）；HTTP 连接池 `MaxIdleConns` 上限 + `IdleConnTimeout` 回收；
+- `execCmd` 的 `time.After` 为单次 select 兜底，非热路径，无累积。
+- 结论：零改动，审计通过。

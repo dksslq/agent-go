@@ -1254,6 +1254,24 @@ func showPending() {
 	}
 }
 
+// pipePrompt merges -pipe stdin data with -prompt: -prompt is the instruction,
+// stdin is the payload; either alone works, both are joined with a blank line.
+func pipePrompt(prompt string, stdin io.Reader) (string, error) {
+	data, err := io.ReadAll(stdin)
+	if err != nil {
+		return "", err
+	}
+	p := strings.TrimSpace(string(data))
+	switch {
+	case prompt == "":
+		return p, nil
+	case p == "":
+		return prompt, nil
+	default:
+		return prompt + "\n\n" + p, nil
+	}
+}
+
 func main() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1267,6 +1285,7 @@ func main() {
 
 	var promptFlag = flag.String("prompt", "", "User prompt (non-interactive if used with -once)")
 	var onceFlag = flag.Bool("once", false, "Exit after processing -prompt")
+	var pipeFlag = flag.Bool("pipe", false, "Read stdin until EOF as prompt content; combines with -prompt (-prompt = instruction, stdin = data). Implies -once")
 	var loadFlag = flag.String("load", "", "Load session from file at startup (must exist)")
 	var saveFlag = flag.String("save", "", "Auto-save session to this file after each turn")
 	var continueFlag = flag.String("continue", "", "Continue session from file, auto-saving back to the same file (creates a new session if the file does not exist)")
@@ -1306,6 +1325,20 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Error: -model must be specified")
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	if *pipeFlag {
+		p, err := pipePrompt(*promptFlag, os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading stdin: %v\n", err)
+			os.Exit(1)
+		}
+		if p == "" {
+			fmt.Fprintln(os.Stderr, "Error: -pipe requires stdin data or -prompt")
+			os.Exit(1)
+		}
+		*promptFlag = p
+		*onceFlag = true
 	}
 
 	loadFile := *loadFlag
