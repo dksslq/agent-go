@@ -62,22 +62,74 @@
 `-pipe` 让 agentlet 成为标准 Unix 过滤器——`-prompt` 是指令，stdin 是数据：
 
 ```bash
-# 日志分析：stdin 为数据，-prompt 为指令
-cat error.log | agentlet -model glm-4.7 -api-base … -api-key … -pipe -prompt "定位根因，给出修复命令"
+cat error.log | agentlet -model glm-4.7 -api-base https://api.z.ai/api/paas/v4 -api-key "$ZAI_API_KEY" \
+        -pipe -prompt "定位根因，给出修复命令"
 
-agentlet … -pipe < task.md > result.md
+agentlet -model glm-4.7 -api-base https://api.z.ai/api/paas/v4 -api-key "$ZAI_API_KEY" \
+        -pipe < task.md > result.md
 ```
+
+**输出纪律**：stdin 非终端（管道 / 重定向）时，stdout 只有模型输出，启动信息与错误全部走 stderr；退出码 `0` 正常 / `1` 出错 / `130` 被中断——三种身份都能被脚本直接消费。
 
 **并发就是进程**，刻意不内置线程池与队列：N 个 agentlet = N 个 OS 进程，交给久经考验的 Unix 编排器，无共享状态、无锁、崩溃互不传染——
 
 ```bash
 # 100 个任务、8 路并行，每路一个自治 agent
-ls tasks/*.md | xargs -P 8 -I{} sh -c 'agentlet … -pipe < {} > {}.out'
+ls tasks/*.md | xargs -P 8 -I{} sh -c 'agentlet -model glm-4.7 -api-base https://api.z.ai/api/paas/v4 \
+        -api-key "$ZAI_API_KEY" -pipe < {} > {}.out'
 ```
 
 适合放进去的场景：**cron / CI 步骤 / systemd timer 里的自治工人**，**工业内网数据管道的加工工序**，**xargs · make -j 式批量并行分片**。配合 `-continue` 断点续跑；配合逐字节恒定的系统提示词吃满模型端前缀缓存——大规模并发运行的计费最优解。
 
 > 人机模式让人掌舵，自主模式让机器干活——并发与容错交给操作系统，这是 Unix 的做法。
+
+## 🔭 场景推演：当模型足够可靠
+
+下面只做推演，不跑分：**用到的原语今天全部存在**，唯一变量是模型的可靠性。每项"未来能力"都对应一个现有机制——
+
+| 愿景里的说法 | 今天就有的原语 |
+|---|---|
+| 主 agent 自主控制并发 | `exec` 本来就能启动任意程序——包括再启动 N 个 `agentlet -pipe` 子代理 |
+| 主 agent 记忆 | `-continue` 的会话文件就是磁盘上的纯 JSON，主 agent 可用 `exec` 读写自己的记忆 |
+| 侧 agent 压缩对话 | 会话 JSON 管道给侧 agentlet 摘要，校验后原子替换回主会话 |
+| 重生 | systemd `Restart=on-failure` / cron 重拉，`-continue` 从最近一轮自动存档续跑 |
+| 自治 | 退出码 + 每轮自动存档 + 纯净 stdout（自主模式 stdout 只有模型输出，其余走 stderr） |
+
+### 例子：工厂班次交付与报表（流程描述，非跑分）
+
+一台内网主机、一个低权用户、一个 systemd timer：
+
+```ini
+# /etc/systemd/system/shift-report.timer
+[Timer]
+OnCalendar=*-*-* 06:00
+
+[Install]
+WantedBy=timers.target
+```
+
+```ini
+# /etc/systemd/system/shift-report.service
+[Service]
+Type=oneshot
+User=agentlet
+EnvironmentFile=/etc/agentlet/shift.env
+ExecStart=/usr/bin/agentlet -model ${MODEL} -api-base ${API_BASE} -api-key ${API_KEY} \
+          -continue /var/lib/agentlet/shift.session \
+          -pipe -prompt "新班次开始。读取队列任务，全部完成后生成交付报表。"
+Restart=on-failure
+RestartSec=30
+```
+
+发生了什么（每一步都是上表中的原语）：
+
+1. **06:00 systemd 拉起主 agent**：`-pipe` 把当日任务队列表作为数据注入，`-continue` 载入昨天的会话——这就是主 agent 的长期记忆；
+2. 主 agent 用 `exec` 读到产线系统导出的本地 CSV 后，**自己决定分片与并发**（例如 `ls /data/line*.csv | xargs -P 3 -I{} … agentlet -pipe < {} > {}.summary`）——分几路、怎么分，是模型在会话里定的，不是框架定的；
+3. 收齐侧 agent 摘要后生成交付报表写入 `/srv/reports/`，投递走主机上已有通道（邮件 / 内部网关）——agentlet 自身只有模型 API 一条网络连接，grep 可审计；
+4. **进程夜间被杀也没关系**：`Restart=on-failure` 重拉，`-continue` 从最近一轮自动存档继续，已完成的轮次不重做——这就是重生；
+5. 会话越长越贵：主 agent 定期把 `shift.session` 管道给一个侧 agentlet 压缩成最小状态（"保留目标、未完成事项、关键事实，只输出 JSON 数组"），`python3 -m json.tool` 校验通过后原子替换——这就是侧 agent 压缩对话；上下文不无限膨胀，前缀缓存依然命中。
+
+护栏全在进程外（见「适用环境与安全模型」）：低权用户、报表目录最小写权限、出站防火墙只放行模型 API。这套流程今天就能部署——**它能不能跑得稳，取决于模型的可靠性；而这正是 agentlet 被设计成"无魔法、可 grep、可重生"的原因：把不可靠的部件，放进一个可观察、可重生、权限受控的骨架里。**
 
 ## 🚀 快速开始
 

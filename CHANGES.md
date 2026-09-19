@@ -162,3 +162,20 @@ less agent-fix.patch
 - **goroutine 有界且全有退出条件**（exec 写读双协程、并行工具 WaitGroup、SSE 读循环、信号处理）；HTTP 连接池 `MaxIdleConns` 上限 + `IdleConnTimeout` 回收；
 - `execCmd` 的 `time.After` 为单次 select 兜底，非热路径，无累积。
 - 结论：零改动，审计通过。
+
+---
+
+# v1.7：自主模式输出纪律 + 场景推演文档
+
+## 输出纪律（stdin 非终端 → stdout 纯净）
+
+- 新 `infof`：操作杂音（Session loaded / Auto-save enabled / Runtime error / [Interrupted] 等 12 处）在 stdin 非终端时改走 stderr；`showSystemPrompt` 在非终端 stdin 下不再回显。
+- 自主模式（-once / -pipe）stdout 从此只有模型输出：`agentlet -pipe < task.md > result.md` 字面成立（假端点实测：stdout 仅模型答案一词，杂音全在 stderr，exit 0）。
+- 交互模式（TTY stdin）行为不变；退出码口径写入文档：0 正常 / 1 出错 / 130 中断。
+- 说明：v1.6 文档中的重定向示例在 v1.6 实现下会混入启动信息——本版修正实现而非放宽文档（文档必须是真的）。
+
+## 文档：场景推演 + 使用说明调优
+
+- README 新「🔭 场景推演：当模型足够可靠」：只使用现有原语推演自治生产——主 agent 自主控并发（exec 再 spawn agentlet）、主 agent 记忆（-continue 会话即磁盘 JSON）、侧 agent 压缩对话（会话管道给侧 agent 摘要后校验替换）、重生（Restart=on-failure + 断点续跑）、自治（退出码 + 自动存档）；逐项映射到现有机制。
+- 工业例子：工厂班次交付与报表全流程（systemd timer + EnvironmentFile + -continue 记忆 + 模型自主 xargs 并行 + 侧 agent 压缩 + 夜间被杀重生），明确标注"流程描述，非跑分"；护栏全部落在进程外。
+- 使用说明调优：自主模式示例补全为可粘贴完整命令（消除省略号）；新增输出纪律与退出码段。

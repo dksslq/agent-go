@@ -665,6 +665,17 @@ func putf(format string, args ...interface{}) {
 	put(fmt.Sprintf(format, args...))
 }
 
+// infof routes operational chatter: interactive terminals see it on stdout;
+// when stdin is not a terminal (piped / autonomous runs) it goes to stderr,
+// keeping stdout clean for model output only.
+func infof(format string, args ...interface{}) {
+	if termRaw {
+		putf(format, args...)
+		return
+	}
+	fmt.Fprintf(os.Stderr, format, args...)
+}
+
 func runToolsParallel(ctx context.Context, calls []ToolCall) []Message {
 	n := len(calls)
 	if n == 0 {
@@ -1186,6 +1197,9 @@ func loadSession(path string) ([]Message, error) {
 }
 
 func showSystemPrompt(messages []Message) {
+	if !termRaw {
+		return // autonomous / piped runs: stdout carries model output only
+	}
 	if len(messages) == 0 {
 		return
 	}
@@ -1378,12 +1392,12 @@ func main() {
 		loaded, err := loadSession(loadFile)
 		switch {
 		case err == nil && loaded == nil:
-			putf("Session file %s is empty; starting new session.\n", loadFile)
+			infof("Session file %s is empty; starting new session.\n", loadFile)
 		case err == nil:
 			messages = loaded
-			put("Session loaded.\n")
+			infof("Session loaded.\n")
 		case errors.Is(err, os.ErrNotExist) && !strictLoad:
-			putf("Session file %s not found; starting new session.\n", loadFile)
+			infof("Session file %s not found; starting new session.\n", loadFile)
 		default:
 			if termRaw {
 				restoreTerm(termFd, termOld)
@@ -1407,7 +1421,7 @@ func main() {
 		for range sigCh {
 			if c := interruptMgr.get(); c != nil {
 				interruptMgr.clear()
-				put("\n\033[33m[Interrupting...]\033[0m\n")
+				infof("\n\033[33m[Interrupting...]\033[0m\n")
 				c()
 			} else {
 				if termRaw {
@@ -1419,7 +1433,7 @@ func main() {
 	}()
 
 	if saveFile != "" {
-		putf("Auto-save enabled: %s\n", saveFile)
+		infof("Auto-save enabled: %s\n", saveFile)
 	}
 
 	if *promptFlag != "" {
@@ -1437,15 +1451,15 @@ func main() {
 
 		if saveFile != "" {
 			if serr := saveSession(saveFile, messages); serr != nil {
-				putf("Auto-save failed: %v\n", serr)
+				infof("Auto-save failed: %v\n", serr)
 			}
 		}
 
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
-				put("\033[33m[Interrupted]\033[0m\n")
+				infof("\033[33m[Interrupted]\033[0m\n")
 			} else {
-				putf("\nRuntime error: %v\n", err)
+				infof("\nRuntime error: %v\n", err)
 			}
 		}
 		if *onceFlag {
@@ -1453,7 +1467,7 @@ func main() {
 		}
 	}
 
-	put("Agent started. Type 'exit' to quit. Type '/help' for commands.\n")
+	infof("Agent started. Type 'exit' to quit. Type '/help' for commands.\n")
 	reader := bufio.NewReader(os.Stdin)
 
 	for {
@@ -1461,10 +1475,10 @@ func main() {
 		input, err := readLine(reader)
 		if err != nil {
 			if err == io.EOF {
-				put("Session ended.\n")
+				infof("Session ended.\n")
 				break
 			}
-			putf("Input read error: %v\n", err)
+			infof("Input read error: %v\n", err)
 			break
 		}
 		input = strings.TrimSpace(input)
@@ -1472,7 +1486,7 @@ func main() {
 			continue
 		}
 		if input == "exit" || input == "quit" {
-			put("Session ended.\n")
+			infof("Session ended.\n")
 			return
 		}
 
@@ -1599,15 +1613,15 @@ func main() {
 
 		if saveFile != "" {
 			if serr := saveSession(saveFile, messages); serr != nil {
-				putf("Auto-save failed: %v\n", serr)
+				infof("Auto-save failed: %v\n", serr)
 			}
 		}
 
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
-				put("\033[33m[Interrupted]\033[0m\n")
+				infof("\033[33m[Interrupted]\033[0m\n")
 			} else {
-				putf("\nRuntime error: %v\n", err)
+				infof("\nRuntime error: %v\n", err)
 			}
 		}
 	}
