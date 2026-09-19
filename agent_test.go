@@ -166,43 +166,23 @@ func TestReadLinePipe(t *testing.T) {
 	}
 }
 
-// ---------- system prompt: build / refresh ----------
+// ---------- system prompt ----------
 
-func TestBuildSystemPrompt(t *testing.T) {
-	s := buildSystemPrompt()
+// 系统提示词必须完全静态：任何环境信息（TZ/OS/Exe/变量）跨运行即失真，
+// 静态写入只会打穿模型端前缀缓存；模型需要时可用 exec 实时探测。
+func TestSystemRules(t *testing.T) {
+	s := systemRules()
 	for _, want := range []string{
 		"SYSTEM: Go runtime", "(9) exec accepts", strconv.Quote(interruptedMarker),
-		"Timestamp: ", "TZ: ", "OS: ", "PID: " + strconv.Itoa(os.Getpid()), "PATH=",
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("missing %q in system prompt", want)
 		}
 	}
-	if n := strings.Count(s, systemEnvMarker); n != 1 {
-		t.Fatalf("ENV marker count = %d, want 1", n)
-	}
-}
-
-func TestRefreshSystemEnv(t *testing.T) {
-	old := systemRules() + systemEnvMarker + "Timestamp: 2000-01-01T00:00:00Z\nPID: 999999"
-	got := refreshSystemEnv(old)
-	if !strings.HasPrefix(got, systemRules()) {
-		t.Fatal("rules section altered")
-	}
-	if !strings.Contains(got, "PID: "+strconv.Itoa(os.Getpid())) {
-		t.Fatal("PID not refreshed to current process")
-	}
-	if strings.Contains(got, "999999") {
-		t.Fatal("stale PID survived")
-	}
-
-	if got := refreshSystemEnv("custom persona prompt"); got != "custom persona prompt" {
-		t.Fatal("custom system without ENV section must be untouched")
-	}
-
-	double := systemRules() + systemEnvMarker + "A" + systemEnvMarker + "B"
-	if got := refreshSystemEnv(double); !strings.HasSuffix(got, "A"+systemEnvMarker+systemEnv()) {
-		t.Fatal("refresh must replace only the last ENV section")
+	for _, ban := range []string{"ENV:", "TZ:", "OS:", "Exe:", "Timestamp:", "PID:", "Vars:", "PATH="} {
+		if strings.Contains(s, ban) {
+			t.Fatalf("environment detail %q must not be in system prompt (goes stale, breaks prefix cache)", ban)
+		}
 	}
 }
 
@@ -210,7 +190,7 @@ func TestRefreshSystemEnv(t *testing.T) {
 
 func sampleSession() []Message {
 	return []Message{
-		{Role: "system", Content: "custom persona without env section"},
+		{Role: "system", Content: "custom persona"},
 		{Role: "user", Content: "hi"},
 		{Role: "assistant", Content: "let me look", ToolCalls: []ToolCall{{
 			ID: "call1", Type: "function",
@@ -263,36 +243,6 @@ func TestLoadSessionInvalidJSON(t *testing.T) {
 func TestLoadSessionMissing(t *testing.T) {
 	if _, err := loadSession(filepath.Join(t.TempDir(), "nope.json")); err == nil {
 		t.Fatal("expected error for missing file")
-	}
-}
-
-func TestLoadSessionRefreshesSystemEnv(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "s.json")
-	stale := systemRules() + systemEnvMarker + "Timestamp: 2000-01-01T00:00:00Z\nPID: 999999"
-	msgs := []Message{
-		{Role: "system", Content: stale},
-		{Role: "user", Content: "hi"},
-	}
-	b, _ := json.Marshal(msgs)
-	if err := os.WriteFile(path, b, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	got, err := loadSession(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sys := got[0].Content.(string)
-	if !strings.HasPrefix(sys, systemRules()) {
-		t.Fatal("rules section altered on load")
-	}
-	if !strings.Contains(sys, "PID: "+strconv.Itoa(os.Getpid())) {
-		t.Fatal("PID not refreshed on load")
-	}
-	if strings.Contains(sys, "999999") {
-		t.Fatal("stale PID survived reload")
-	}
-	if got[1].Content != "hi" {
-		t.Fatal("non-system message altered")
 	}
 }
 

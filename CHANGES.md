@@ -112,3 +112,28 @@ less agent-fix.patch
 - Source/Package: `agentlet`，`Upstream-Name: agent-go`；rules 增加 agent-go → agentlet 二进制改名（dh-golang 以模块基名产出）。
 - changelog 重写为 agentlet 0.1.0-1 首包；CI / release 工作流改由 `dpkg-parsechangelog` 派生源包名与版本（后续改名零 CI 改动）。
 - deb 内二进制 `/usr/bin/agentlet`；`go install github.com/dksslq/agent-go@latest` 产物仍为 `agent-go`（模块路径 = 仓库名），README 安装表分列注明。
+
+---
+
+# v1.4：ENV 段缓存友好化（PID/时间戳移出系统提示词）
+
+## 权衡：语义正确性 × 前缀缓存计费
+
+- 问题：v1.1"载入即刷新"保证了语义正确，但 ENV 的 Timestamp（秒级）与 PID 每次重启必然变化。模型端前缀缓存（DeepSeek 命中价约 0.1×、OpenAI 0.5×）按前缀匹配，system 消息位于前缀头部——任一字节变化即打穿整个会话历史，长会话每次重载全额重计费。
+- 权衡原则：按**稳定性分层**，而非"刷新 vs 舍弃"二选一：
+  1. 稳定字段（TZ / OS / Exe / PATH / HOME / USER / SHELL / LANG / TEMP / TMP / PWD）保留：环境未变则字节不变，缓存跨运行命中；
+  2. 必然易变且低价值（PID、Timestamp）舍弃：模型可按需 `exec` 跑 `echo $PPID` / `date` 即时探测；
+  3. PWD 留在稳定块：它只在真实变化时破坏缓存——那正是语义确实变化、值得一次 miss 的时刻。
+- `refreshSystemEnv` 机制保留，且现为**字节幂等**（同环境刷新结果逐字节相同）：v1.1 解决语义过期，本版解决计费过期，统一为"缓存只在语义真实变化时失效"。
+- 兼容：旧格式会话（含 PID/时间戳）载入时自动清洗为新格式，一次性合法 miss。
+- 说明：缓存自身有 TTL（分钟~小时级），跨运行命中以 TTL 内重载为前提；本改动保证的是"不主动破坏缓存"。
+- 测试新增守卫：系统提示词禁含 Timestamp/PID；刷新字节幂等；旧格式载入清洗。
+
+---
+
+# v1.5：系统提示词完全静态（ENV 段整体移除）
+
+- **ENV 段整体删除**（v1.4 保留的 TZ / OS / Exe 一并不要）：任何环境信息写入系统提示词都是矛盾的——要么跨运行失真（Stale），要么打穿模型端前缀缓存（计费）；模型本可按需 `exec` 探测（`pwd` / `date` / `uname` / `echo $PATH`），拿到的永远是实时真值。
+- 系统提示词收敛为纯 `systemRules()`：9 条规则，与运行环境零关联，跨运行 / 跨机器 / 跨会话逐字节恒定，前缀缓存天然全命中。
+- 死代码级联清理：`systemEnv` / `systemEnvMarker` / `refreshSystemEnv` / `buildSystemPrompt` 整体删除；`loadSession` 载入刷新循环删除（会话文件即存即载，无隐藏改写）。
+- 测试守卫改为正向不变量：系统提示词禁含 `ENV:` / `TZ:` / `OS:` / `Exe:` / `Timestamp:` / `PID:` / `Vars:` / `PATH=` 任何环境痕迹。

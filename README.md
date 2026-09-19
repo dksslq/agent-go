@@ -119,7 +119,7 @@ rg -n 'os\.(Open|Create)' agent.go   # 文件面：只有媒体与会话
 
 | 套件 | 用例 | 覆盖 | 平台 |
 |---|---|---|---|
-| `agent_test.go` | 16 函数 / 31 用例 | 会话存档 round-trip（多模态 / tool_calls / tool 成对）；空、坏、缺文件；**system ENV 载入即刷新**（PID/时间戳/环境变量更新为当前进程，规则段与自定义 system 原样保留）；提示词结构；转义序列吞除（管道模式）；控制字符；媒体读取（类型 / 大小 / 目录）；工具辅助（wrapResult / 参数解析）；sanitize；ANSI 剥离 | 全平台 |
+| `agent_test.go` | 14 函数 / 29 用例 | 会话存档 round-trip（多模态 / tool_calls / tool 成对）；空、坏、缺文件；**系统提示词完全静态——ENV / TZ / OS / 时间戳 / PID / 变量一律不进提示词（跨运行逐字节恒定，前缀缓存天然全命中），环境按需 `exec` 实时探测**；转义序列吞除（管道模式）；控制字符；媒体读取（类型 / 大小 / 目录）；工具辅助（wrapResult / 参数解析）；sanitize；ANSI 剥离 | 全平台 |
 | `sse_test.go` | 13 函数 | SSE 全链路（httptest 假端点）：reasoning / content 分流；tool_calls 乱序分片累积、finish 触发与 EOF 兜底、`[DONE]` 停读；自定义字段映射；坏行跳过；API 错误；断连；ctx 取消；请求形状（model / tools / auth / `-extra` 合并）；**工具轮次护栏端到端**（assistant 与 tool 消息严格成对） | 全平台 |
 | `pty_readline_test.go` | 3 用例 | 真实 `/dev/ptmx` 伪终端 + raw mode 驱动真实 `readLine`：方向键 / Home / Delete 不污染输入、纯文本、退格编辑 | linux |
 
