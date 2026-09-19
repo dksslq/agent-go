@@ -9,7 +9,7 @@
 [![Go](https://img.shields.io/badge/Go-1.21%2B-00ADD8?logo=go&logoColor=white)](#-快速开始)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#-快速开始)
 [![Deps](https://img.shields.io/badge/third--party%20deps-zero-3fb950)](#-特性)
-[![Tests](https://img.shields.io/badge/tests-32%20pass%20%C2%B7%200%20test%20deps-3fb950)](#-测试与质量)
+[![Tests](https://img.shields.io/badge/tests-30%20pass%20%C2%B7%200%20test%20deps-3fb950)](#-测试与质量)
 [![License](https://img.shields.io/badge/license-MIT-green)](#-许可)
 [![Designed by](https://img.shields.io/badge/designed%20by-DeepSeek%20%C3%97%20GLM-ff7b72)](#-designed-by-deepseek--glm)
 [![CI](https://github.com/dksslq/agent-go/actions/workflows/ci.yml/badge.svg)](https://github.com/dksslq/agent-go/actions/workflows/ci.yml)
@@ -32,6 +32,22 @@
 | ⌨️ **终端原生** | raw mode 行内编辑（退格即见即所得）；**Ctrl+C 中断当前推理轮、再按退出**；转义序列安全吞除——方向键 / Home / Delete 不会污染输入（有 PTY 实测背书） |
 | 🛡 **防御性默认** | `-max-tool-rounds` 工具轮次护栏（默认 25，对齐 OpenAI Agents SDK / LangChain 惯例）、工具流空闲超时、媒体体积上限、panic 恢复并自动还原终端状态 |
 | 🔌 **即插即用** | 直连任何 **OpenAI 兼容 API**（GLM / DeepSeek / OpenAI / vLLM / Ollama…）；`-extra` 以 Base64 注入任意 JSON 请求字段，厂商私有参数全兼容 |
+
+## 🎯 适用环境与安全模型
+
+**为受信任的本地环境设计**：个人开发机、工业生产内网主机、封闭运维终端——你合法拥有、且有必要让模型直接操作这台机器的场景。
+
+**agent 本身零权限限制**：`exec` 运行任意程序、继承进程的完整 OS 权限——无沙箱、无白名单、无确认弹窗。这是刻意的最小设计：权限决策交给使用者与外部机制，而不是内置一套可被提示词绕过的伪防线（提示词层只做一件事：声明工具输出不可信，防注入指令）。
+
+**限制必须来自外部**——与对待 shell 完全同理：
+
+| 层 | 手段 |
+|---|---|
+| OS | 专用低权用户运行；按需收敛文件系统权限 |
+| 隔离 | 容器 / namespace / chroot / 独立虚拟机 |
+| 网络 | 防火墙收敛出站（程序自身只需访问模型 API 一条） |
+
+> 把 agentlet 当作 shell 的等价物：它不是玩具，也不要让它接触不可信来源的输入。
 
 ## 🚀 快速开始
 
@@ -137,7 +153,7 @@ agent-go
 ├── term_windows.go
 ├── exec_unix.go           # 平台适配：进程组（Unix）/ Windows 空实现
 ├── exec_windows.go
-├── agent_test.go          # 全平台单测：会话 / 提示词刷新 / 输入 / 媒体 / 工具辅助
+├── agent_test.go          # 全平台单测：会话 / 提示词静态守卫 / 输入 / 媒体 / 工具辅助
 ├── sse_test.go            # 全平台单测：SSE 全链路（httptest）/ 轮次护栏端到端
 ├── pty_readline_test.go   # PTY 输入回归实测（linux only）
 ├── go.mod
