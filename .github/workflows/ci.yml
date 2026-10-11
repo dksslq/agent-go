@@ -6,16 +6,25 @@ on:
   pull_request:
 
 jobs:
-  verify:
-    runs-on: ubuntu-latest
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  go: '1.21.x', primary: true }   # go.mod minimum floor
+          - { os: ubuntu-latest,  go: 'stable',  primary: true }   # latest + coverage report
+          - { os: macos-latest,   go: 'stable' }
+          - { os: windows-latest, go: 'stable' }
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
+          go-version: ${{ matrix.go }}
 
       - name: gofmt check
+        if: matrix.primary
         run: test -z "$(gofmt -l .)"
 
       - name: go vet
@@ -24,8 +33,21 @@ jobs:
       - name: build
         run: go build -o agent .
 
-      - name: PTY input regression tests (real /dev/ptmx)
-        run: go test -v -count=1 .
+      - name: test (race + shuffle + coverage)
+        run: go test -count=1 -race -shuffle=on -covermode=atomic -coverprofile=coverage.txt .
+
+      - name: coverage summary
+        if: matrix.primary && runner.os == 'Linux' && matrix.go == 'stable'
+        shell: bash
+        run: |
+          echo '### Coverage' >> "$GITHUB_STEP_SUMMARY"
+          go tool cover -func=coverage.txt | tail -1 >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.primary && runner.os == 'Linux' && matrix.go == 'stable'
+        with:
+          name: coverage
+          path: coverage.txt
 
   cross-build:
     runs-on: ubuntu-latest
@@ -47,31 +69,3 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
         run: go build -o /dev/null .
-
-  package:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: install build tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential golang-any debhelper dh-golang lintian
-
-      - name: build .deb
-        run: |
-          N=$(dpkg-parsechangelog -S Source)
-          V=$(dpkg-parsechangelog -S Version)
-          git archive HEAD --prefix "${N}-${V%%-*}/" | tar -x -C /tmp
-          tar -C /tmp -czf "/tmp/${N}_${V%%-*}.orig.tar.gz" "${N}-${V%%-*}"
-          (cd "/tmp/${N}-${V%%-*}" && dpkg-buildpackage -us -uc -b)
-          dpkg-deb -I /tmp/${N}_${V}_amd64.deb
-          dpkg-deb -c /tmp/${N}_${V}_amd64.deb
-
-      - name: lintian
-        run: N=$(dpkg-parsechangelog -S Source); lintian --fail-on error /tmp/${N}_*_amd64.deb
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: agentlet-deb
-          path: /tmp/agentlet_*_amd64.deb

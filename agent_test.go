@@ -375,23 +375,23 @@ func TestExecCmdReal(t *testing.T) {
 
 func TestRunToolErrors(t *testing.T) {
 	ctx := context.Background()
-	r, _ := runTool(ctx, "nope", "{}")
+	r, _ := runTool(ctx, nil, "nope", "{}")
 	if !strings.Contains(r, "Unknown tool: nope") {
 		t.Fatalf("unknown tool: %q", r)
 	}
-	r, _ = runTool(ctx, "exec", "not-json")
+	r, _ = runTool(ctx, nil, "exec", "not-json")
 	if !strings.Contains(r, "Invalid arguments JSON") {
 		t.Fatalf("bad json: %q", r)
 	}
-	r, _ = runTool(ctx, "exec", `{"program":""}`)
+	r, _ = runTool(ctx, nil, "exec", `{"program":""}`)
 	if !strings.Contains(r, "program is required") {
 		t.Fatalf("missing program: %q", r)
 	}
-	r, _ = runTool(ctx, "exec", `{"program":"echo","args":[1]}`)
+	r, _ = runTool(ctx, nil, "exec", `{"program":"echo","args":[1]}`)
 	if !strings.Contains(r, "all args elements must be strings") {
 		t.Fatalf("bad args: %q", r)
 	}
-	r, _ = runTool(ctx, "exec", `{"program":"echo"}`)
+	r, _ = runTool(ctx, nil, "exec", `{"program":"echo"}`)
 	if !strings.Contains(r, "timeout_seconds is required") {
 		t.Fatalf("missing timeout: %q", r)
 	}
@@ -403,7 +403,7 @@ func TestRunToolExecFlags(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	r, _ := runTool(ctx, "exec", `{"program":"echo","args":["\"hi there\""],"unquote_arguments":true,"timeout_seconds":5}`)
+	r, _ := runTool(ctx, nil, "exec", `{"program":"echo","args":["\"hi there\""],"unquote_arguments":true,"timeout_seconds":5}`)
 	var tr ToolResult
 	if err := json.Unmarshal([]byte(r), &tr); err != nil {
 		t.Fatal(err)
@@ -412,7 +412,7 @@ func TestRunToolExecFlags(t *testing.T) {
 		t.Fatalf("unquote_arguments not applied: %q", tr.Result)
 	}
 
-	r, _ = runTool(ctx, "exec", `{"program":"echo","args":["quoted"],"quote_result":true,"timeout_seconds":5}`)
+	r, _ = runTool(ctx, nil, "exec", `{"program":"echo","args":["quoted"],"quote_result":true,"timeout_seconds":5}`)
 	if err := json.Unmarshal([]byte(r), &tr); err != nil {
 		t.Fatal(err)
 	}
@@ -494,4 +494,110 @@ func TestBuildUserMessage(t *testing.T) {
 	if blocks = m.Content.([]ContentBlock); len(blocks) != 1 {
 		t.Fatalf("empty text must drop text block: %#v", blocks)
 	}
+}
+
+// ---------- memory_edit (in-session history self-organization) ----------
+
+func assertPairing(t *testing.T, msgs []Message) {
+	t.Helper()
+	// the trailing message is the current round's assistant(tool_calls) whose
+	// results are appended by the loop later — pairing is asserted for the rest
+	for i := 0; i < len(msgs)-1; i++ {
+		m := msgs[i]
+		if len(m.ToolCalls) > 0 {
+			if i+1+len(m.ToolCalls) > len(msgs) {
+				t.Fatalf("assistant(tool_calls) at %d lacks trailing tool results", i)
+			}
+			for j := 0; j < len(m.ToolCalls); j++ {
+				tr := msgs[i+1+j]
+				if tr.Role != "tool" || tr.ToolCallID != m.ToolCalls[j].ID {
+					t.Fatalf("pairing broken after assistant@%d: %+v", i, tr)
+				}
+			}
+		}
+	}
+}
+
+func TestApplyMemoryEdit(t *testing.T) {
+	sys := Message{Role: "system", Content: "s"}
+	cur := Message{Role: "assistant", ToolCalls: []ToolCall{{ID: "m1", Type: "function", Function: FunctionCall{Name: "memory_edit", Arguments: "{}"}}}}
+	toolMsg := func(id string) Message {
+		return Message{Role: "tool", ToolCallID: id, Content: "r"}
+	}
+
+	t.Run("summary required", func(t *testing.T) {
+		in := []Message{sys, {Role: "user", Content: "u1"}, cur}
+		out, report := applyMemoryEdit(in, "  ", 0)
+		if len(out) != len(in) || !strings.HasPrefix(report, "Error") {
+			t.Fatalf("empty summary must be rejected: %+v %q", out, report)
+		}
+	})
+	t.Run("nothing to organize", func(t *testing.T) {
+		in := []Message{sys, cur}
+		if _, report := applyMemoryEdit(in, "sum", 0); !strings.HasPrefix(report, "Error") {
+			t.Fatalf("want error, got %q", report)
+		}
+	})
+	t.Run("drop all by default", func(t *testing.T) {
+		in := []Message{sys, {Role: "user", Content: "u1"}, {Role: "assistant", Content: "a1"}, {Role: "user", Content: "u2"}, cur}
+		out, report := applyMemoryEdit(in, "summary", 0)
+		assertPairing(t, out)
+		if len(out) != 3 || out[1].Role != "user" || out[1].Content != "summary" {
+			t.Fatalf("want [sys summary cur], got %+v", out)
+		}
+		if !strings.Contains(report, "dropped 3") {
+			t.Fatalf("report: %q", report)
+		}
+	})
+	t.Run("keep_last is turn-aligned", func(t *testing.T) {
+		in := []Message{sys, {Role: "user", Content: "u1"}, {Role: "assistant", ToolCalls: []ToolCall{{ID: "a", Type: "function", Function: FunctionCall{Name: "exec"}}}}, toolMsg("a"), {Role: "user", Content: "u2"}, {Role: "assistant", Content: "a2"}, cur}
+		out, report := applyMemoryEdit(in, "sum", 3)
+		assertPairing(t, out)
+		// the kept window must start at the user message, not at the orphaned tool result
+		roles := []string{"system", "user", "user", "assistant", "assistant"}
+		for i, want := range roles {
+			if out[i].Role != want {
+				t.Fatalf("out[%d].role=%q want %q (%+v)", i, out[i].Role, want, out)
+			}
+		}
+		if !strings.Contains(report, "dropped 3") {
+			t.Fatalf("report: %q", report)
+		}
+		// keep_last that can only be honored by keeping a lone tool result must drop everything instead
+		out, _ = applyMemoryEdit([]Message{sys, {Role: "user", Content: "u1"}, {Role: "assistant", ToolCalls: []ToolCall{{ID: "a", Type: "function", Function: FunctionCall{Name: "exec"}}}}, toolMsg("a"), cur}, "sum", 1)
+		assertPairing(t, out)
+		if len(out) != 3 {
+			t.Fatalf("lone tool result must not be kept: %+v", out)
+		}
+	})
+	t.Run("keep covers all", func(t *testing.T) {
+		in := []Message{sys, {Role: "user", Content: "u1"}, cur}
+		out, report := applyMemoryEdit(in, "sum", 99)
+		if len(out) != len(in) || !strings.Contains(report, "Nothing dropped") {
+			t.Fatalf("oversized keep_last must be a no-op: %+v %q", out, report)
+		}
+	})
+	t.Run("no user boundary", func(t *testing.T) {
+		in := []Message{sys, {Role: "assistant", Content: "a1"}, {Role: "assistant", Content: "a2"}, cur}
+		if out, report := applyMemoryEdit(in, "sum", 0); len(out) != len(in) || !strings.HasPrefix(report, "Error") {
+			t.Fatalf("no user message: %+v %q", out, report)
+		}
+	})
+	t.Run("prefix before first user preserved", func(t *testing.T) {
+		pre := Message{Role: "assistant", Content: "aborted marker"}
+		in := []Message{sys, pre, {Role: "user", Content: "u1"}, cur}
+		out, _ := applyMemoryEdit(in, "sum", 0)
+		if len(out) != 4 || out[1].Content != "aborted marker" || out[2].Content != "sum" {
+			t.Fatalf("prefix must survive: %+v", out)
+		}
+	})
+	t.Run("current round untouched", func(t *testing.T) {
+		in := []Message{sys, {Role: "user", Content: "u1"}, cur}
+		out, _ := applyMemoryEdit(in, "sum", 0)
+		assertPairing(t, out)
+		last := out[len(out)-1]
+		if len(last.ToolCalls) != 1 || last.ToolCalls[0].ID != "m1" {
+			t.Fatalf("current assistant(tool_calls) must survive: %+v", last)
+		}
+	})
 }

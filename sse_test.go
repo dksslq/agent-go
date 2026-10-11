@@ -332,7 +332,7 @@ func TestChatStreamRequestShape(t *testing.T) {
 	if _, err := collectStream(t, msgs); err != nil {
 		t.Fatal(err)
 	}
-	if shape.Model != "test-model" || !shape.Stream || len(shape.Messages) != 2 || len(shape.Tools) != 2 {
+	if shape.Model != "test-model" || !shape.Stream || len(shape.Messages) != 2 || len(shape.Tools) != 3 {
 		t.Fatalf("bad request shape: model=%q stream=%v msgs=%d tools=%d",
 			shape.Model, shape.Stream, len(shape.Messages), len(shape.Tools))
 	}
@@ -409,5 +409,71 @@ func TestRunInferenceLoopToolRoundLimit(t *testing.T) {
 	}
 	if atomic.LoadInt64(&mu) != 3 {
 		t.Fatalf("server hits=%d, want 3", mu)
+	}
+}
+
+// ---------- memory_edit end-to-end (in-session memory self-organization) ----------
+
+func TestMemoryEditEndToEnd(t *testing.T) {
+	withStreamDefaults(t)
+	var bodies []map[string]interface{}
+	phase := 0
+	withSSEServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var m map[string]interface{}
+		if json.Unmarshal(body, &m) == nil {
+			bodies = append(bodies, m)
+		}
+		phase++
+		if phase == 1 {
+			io.WriteString(w,
+				toolCallChunk(t, 0, "m1", "memory_edit", `{"summary":"user greeted; agent replied; user asked to organize","keep_last":1}`)+
+					deltaChunk(t, map[string]interface{}{}, "tool_calls"))
+			return
+		}
+		io.WriteString(w, deltaChunk(t, map[string]interface{}{contentField: "done"}, "")+sseData("[DONE]"))
+	})
+
+	msgs := []Message{
+		{Role: "system", Content: "s"},
+		{Role: "user", Content: "hi"},
+		{Role: "assistant", Content: "hello"},
+		{Role: "user", Content: "organize"},
+	}
+	if err := runInferenceLoop(context.Background(), &msgs); err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("expected 2 inference rounds, got %d", len(bodies))
+	}
+
+	r1 := bodies[0]["messages"].([]interface{})
+	if len(r1) != 4 {
+		t.Fatalf("round1 saw %d messages, want 4", len(r1))
+	}
+
+	// round 2 must see the organized memory:
+	// [system, user(summary), user(kept), assistant(tool_calls), tool(result)]
+	r2 := bodies[1]["messages"].([]interface{})
+	want := []string{"system", "user", "user", "assistant", "tool"}
+	if len(r2) != len(want) {
+		t.Fatalf("round2 has %d messages, want %d: %+v", len(r2), len(want), r2)
+	}
+	for i, role := range want {
+		got := r2[i].(map[string]interface{})["role"].(string)
+		if got != role {
+			t.Fatalf("round2[%d].role=%q, want %q", i, got, role)
+		}
+	}
+	sum := r2[1].(map[string]interface{})["content"].(string)
+	if !strings.Contains(sum, "asked to organize") {
+		t.Fatalf("summary message wrong: %q", sum)
+	}
+	var tr ToolResult
+	if err := json.Unmarshal([]byte(fmt.Sprint(r2[4].(map[string]interface{})["content"])), &tr); err != nil {
+		t.Fatalf("memory_edit result not wrapped: %v", err)
+	}
+	if !strings.Contains(tr.Result, "dropped 2") {
+		t.Fatalf("unexpected report: %q", tr.Result)
 	}
 }

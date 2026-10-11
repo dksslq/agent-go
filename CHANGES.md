@@ -191,3 +191,15 @@ less agent-fix.patch
 - 测试：`TestReadMedia` → `TestReadImage`（kind 不匹配用例改为"非图片文件"），39 函数不变
 
 旧版本会话若含视频块，载入后原样保留——发往不支持该类型的端点会被拒绝。属历史数据，不加兼容垫片。
+
+## 厂商分层 + 记忆自整理（v1.9）
+
+**openai.go**：OpenAI 兼容厂商层独立成文件——线格式类型（Message / ContentBlock / Tool…）、传输（chatStream：请求组装、SSE 解析、tool_calls 分片累积）、字段映射（`-reasoning-field` 等 4 个）。agent 侧只消费 `StreamEvent` 事件流，唯一网络面收敛为 openai.go 里的一个 POST；接口即 `chatStream(ctx, msgs) (<-chan StreamEvent, cancel, error)`，在 agent.go 顶部注释钉死。
+
+**memory_edit**：模型同会话自主整理记忆数组的内置工具——`summary`（必填，模型亲写）替换被裁掉的历史，`keep_last` 保真近期原文。实现为纯函数 `applyMemoryEdit`：只在 [system 消息, 当前轮] 的可整理区间内按整轮单元（user 消息边界）裁剪，`tool_calls`/`tool` 配对在结构上不可能破坏；系统消息与当前轮永不触碰。runTool / runToolsParallel 签名升级为接收 `*[]Message`，`memoryMu` 串行化同轮并行工具中的记忆写入。
+
+**输出纪律补全**：管道模式下工具回显（[tool_calls] 意图、[tool: …]、[result]、进度点、reasoning 流、轮次上限标记）全部改走 stderr。v1.7 的"stdout 纯净"此前只覆盖 infof 杂音——本轮实测发现工具路径仍在污染 stdout，od 复验修复后 stdout 恰为模型答案本体。
+
+**CI**：测试矩阵 4 job——ubuntu(go1.21 下限) / ubuntu(stable) / macos / windows × `-race -shuffle=on -covermode=atomic`；coverage 汇总进 step summary 并挂 artifact。
+
+**测试**：41 函数（+`TestApplyMemoryEdit` 8 子用例真值表；+`TestMemoryEditEndToEnd` 两轮请求体对照——同会话记忆重组、配对完好、wire 级验证）。
