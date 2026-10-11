@@ -332,7 +332,7 @@ func TestChatStreamRequestShape(t *testing.T) {
 	if _, err := collectStream(t, msgs); err != nil {
 		t.Fatal(err)
 	}
-	if shape.Model != "test-model" || !shape.Stream || len(shape.Messages) != 2 || len(shape.Tools) != 3 {
+	if shape.Model != "test-model" || !shape.Stream || len(shape.Messages) != 2 || len(shape.Tools) != 2 {
 		t.Fatalf("bad request shape: model=%q stream=%v msgs=%d tools=%d",
 			shape.Model, shape.Stream, len(shape.Messages), len(shape.Tools))
 	}

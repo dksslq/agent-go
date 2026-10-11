@@ -87,9 +87,9 @@ func TestParseBoolFromParams(t *testing.T) {
 	}
 }
 
-// ---------- readMedia (tool file IO) ----------
+// ---------- readImage (tool file IO) ----------
 
-func TestReadMedia(t *testing.T) {
+func TestReadImage(t *testing.T) {
 	dir := t.TempDir()
 	png := filepath.Join(dir, "a.png")
 	if err := os.WriteFile(png, append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 16)...), 0o644); err != nil {
@@ -97,7 +97,7 @@ func TestReadMedia(t *testing.T) {
 	}
 
 	t.Run("valid image", func(t *testing.T) {
-		uri, mime, err := readMedia(png, "image")
+		uri, mime, err := readImage(png)
 		if err != nil || mime != "image/png" {
 			t.Fatalf("mime=%q err=%v", mime, err)
 		}
@@ -105,18 +105,22 @@ func TestReadMedia(t *testing.T) {
 			t.Fatalf("bad data URI: %q", uri[:30])
 		}
 	})
-	t.Run("kind mismatch", func(t *testing.T) {
-		if _, _, err := readMedia(png, "video"); err == nil || !strings.Contains(err.Error(), "not a valid video") {
-			t.Fatalf("expected kind error, got %v", err)
+	t.Run("not an image", func(t *testing.T) {
+		txt := filepath.Join(dir, "a.txt")
+		if err := os.WriteFile(txt, []byte("plain text"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := readImage(txt); err == nil || !strings.Contains(err.Error(), "not a valid image") {
+			t.Fatalf("expected type error, got %v", err)
 		}
 	})
 	t.Run("directory", func(t *testing.T) {
-		if _, _, err := readMedia(dir, "image"); err == nil || !strings.Contains(err.Error(), "directory") {
+		if _, _, err := readImage(dir); err == nil || !strings.Contains(err.Error(), "directory") {
 			t.Fatalf("expected dir error, got %v", err)
 		}
 	})
 	t.Run("missing", func(t *testing.T) {
-		if _, _, err := readMedia(filepath.Join(dir, "nope"), "image"); err == nil || !strings.Contains(err.Error(), "open error") {
+		if _, _, err := readImage(filepath.Join(dir, "nope")); err == nil || !strings.Contains(err.Error(), "open error") {
 			t.Fatalf("expected open error, got %v", err)
 		}
 	})
@@ -124,7 +128,7 @@ func TestReadMedia(t *testing.T) {
 		old := maxFileBytes
 		maxFileBytes = 5
 		defer func() { maxFileBytes = old }()
-		if _, _, err := readMedia(png, "image"); err == nil || !strings.Contains(err.Error(), "too large") {
+		if _, _, err := readImage(png); err == nil || !strings.Contains(err.Error(), "too large") {
 			t.Fatalf("expected size error, got %v", err)
 		}
 	})
@@ -480,15 +484,14 @@ func TestBuildUserMessage(t *testing.T) {
 	}
 	p := &pendingState{
 		images: []ContentBlock{{Type: "image_url", ImageURL: &ImageURL{URL: "data:img"}}},
-		videos: []ContentBlock{{Type: "video_url", VideoURL: &VideoURL{URL: "data:vid"}}},
 	}
 	m = buildUserMessage("look", p)
 	blocks, ok := m.Content.([]ContentBlock)
-	if !ok || len(blocks) != 3 || blocks[0].Text != "look" || blocks[1].ImageURL == nil || blocks[2].VideoURL == nil {
+	if !ok || len(blocks) != 2 || blocks[0].Text != "look" || blocks[1].ImageURL == nil {
 		t.Fatalf("media block order: %#v", blocks)
 	}
 	m = buildUserMessage("", p)
-	if blocks = m.Content.([]ContentBlock); len(blocks) != 2 {
+	if blocks = m.Content.([]ContentBlock); len(blocks) != 1 {
 		t.Fatalf("empty text must drop text block: %#v", blocks)
 	}
 }

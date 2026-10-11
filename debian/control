@@ -16,8 +16,8 @@ Architecture: any
 Depends: ${misc:Depends}, ${shlibs:Depends}
 Description: nano-sized terminal AI agent (streaming, tool-calling, zero deps)
  agentlet streams answers from any OpenAI-compatible chat API, runs
- tools (exec, image_read, video_read) in parallel, accepts image and
- video attachments, and persists sessions as plain JSON — all in
+ tools (exec, image_read) in parallel, accepts image attachments, and
+ persists sessions as plain JSON — all in
  ~1600 lines of dependency-free Go, shipped as a single binary.
  .
  No config files, no plugins, no telemetry: one file to read, one

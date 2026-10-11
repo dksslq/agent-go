@@ -179,3 +179,15 @@ less agent-fix.patch
 - README 新「🔭 场景推演：当模型足够可靠」：只使用现有原语推演自治生产——主 agent 自主控并发（exec 再 spawn agentlet）、主 agent 记忆（-continue 会话即磁盘 JSON）、侧 agent 压缩对话（会话管道给侧 agent 摘要后校验替换）、重生（Restart=on-failure + 断点续跑）、自治（退出码 + 自动存档）；逐项映射到现有机制。
 - 工业例子：工厂班次交付与报表全流程（systemd timer + EnvironmentFile + -continue 记忆 + 模型自主 xargs 并行 + 侧 agent 压缩 + 夜间被杀重生），明确标注"流程描述，非跑分"；护栏全部落在进程外。
 - 使用说明调优：自主模式示例补全为可粘贴完整命令（消除省略号）；新增输出纪律与退出码段。
+
+## 回归 OpenAI 标准：移除视频（v1.8）
+
+`video_url` 内容块不属于 OpenAI Chat Completions 标准（标准多模态仅 `text` + `image_url`）。视频整体砍掉，请求体回归纯标准，任意 OpenAI 兼容端点零扩展、零猜测：
+
+- 删除 `video_read` 工具与 `readVideo`；`readMedia(kind)` 失去存在意义，合并为 `readImage`（`image/` 前缀嗅探不变）
+- `ContentBlock` 删除 `VideoURL`；消息内容块只剩 `text` / `image_url`
+- 删除 `/video`、`/video-url` 命令与 pending 视频逻辑；系统提示词同步收敛（字节恒定性质不变）
+- README、debian/control、debian/changelog 描述同步
+- 测试：`TestReadMedia` → `TestReadImage`（kind 不匹配用例改为"非图片文件"），39 函数不变
+
+旧版本会话若含视频块，载入后原样保留——发往不支持该类型的端点会被拒绝。属历史数据，不加兼容垫片。

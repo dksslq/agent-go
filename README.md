@@ -26,8 +26,8 @@
 |---|---|
 | 🪶 **轻到极致** | 核心逻辑单文件 `agent.go`（~1600 行），**只用 Go 标准库、零第三方依赖、无 cgo**，交叉编译产出单文件二进制 |
 | 🌊 **真流式** | SSE 逐 token 输出；`-reasoning-field` 等 4 个 delta 字段名可映射，**原生兼容 DeepSeek-R1 等推理模型**，思考流与正文分流呈现 |
-| 🔧 **工具调用** | `exec`（stdin 注入 / 超时 / 后台 detach / cwd / 环境注入 / 输出限长）、`image_read`、`video_read`；**同轮多工具并行执行** |
-| 🖼 **多模态** | `/image` `/image-url` `/video` `/video-url` 附件随下一条消息发送——让模型"看得见图、看得了视频" |
+| 🔧 **工具调用** | `exec`（stdin 注入 / 超时 / 后台 detach / cwd / 环境注入 / 输出限长）、`image_read`；**同轮多工具并行执行** |
+| 🖼 **多模态** | `/image` `/image-url` 附件随下一条消息发送——让模型看得见图 |
 | 💾 **会话持久化** | `-save` / `-load` / `-continue` 一键续聊，`/save` `/reload` 在线切换；每轮结束自动存档，对话历史永不丢 |
 | ⌨️ **终端原生** | raw mode 行内编辑（退格即见即所得）；**Ctrl+C 中断当前推理轮、再按退出**；转义序列安全吞除——方向键 / Home / Delete 不会污染输入（有 PTY 实测背书） |
 | 🤖 **全自主可编排** | 人机模式与全自主模式同一二进制：`-once` 内联一句话，`-pipe` 让 stdin 成为数据流——stdin 进、stdout 出、处理完即退、退出码可编排；**并发就是 N 个 OS 进程**，xargs / cron / systemd 任意编排 |
@@ -168,7 +168,6 @@ cat error.log | ./agent -model glm-4.7 -api-base https://api.z.ai/api/paas/v4 \
 | 命令 | 作用 |
 |---|---|
 | `/image <path>` / `/image-url <url>` | 追加图片到下一条消息 |
-| `/video <path>` / `/video-url <url>` | 追加视频到下一条消息 |
 | `/pending` · `/clear` | 查看 / 清空待发媒体 |
 | `/save <file>` · `/reload <file>` | 保存 / 重载会话 |
 | `exit` · `quit` · `Ctrl+D` | 结束会话 |
@@ -186,7 +185,6 @@ cat error.log | ./agent -model glm-4.7 -api-base https://api.z.ai/api/paas/v4 \
 |---|---|
 | `exec` | 启动任意程序并向 **stdin 写入字符串**；必填 `timeout_seconds`；支持 `cwd`、`environ`、`max_output_chars` 截断、`detach` 后台运行、`unquote_arguments` / `quote_result` 转义控制 |
 | `image_read` | 读取本地图片 → base64 data URI，模型直接"看图" |
-| `video_read` | 读取本地视频 → base64 data URI，模型直接"看片" |
 
 ## ⚙️ 参数一览
 
