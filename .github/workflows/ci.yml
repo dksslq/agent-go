@@ -34,6 +34,7 @@ jobs:
         run: go build -o agent .
 
       - name: test (race + shuffle + coverage)
+        shell: bash
         run: go test -count=1 -race -shuffle=on -covermode=atomic -coverprofile=coverage.txt .
 
       - name: coverage summary
