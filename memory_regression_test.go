@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -352,10 +353,10 @@ func TestReloadMemoryHeaderDiscoversCurrentArchive(t *testing.T) {
 	}
 	view := loaded.contextMessages()
 	header, ok := view[1].Content.(string)
-	if !ok || !strings.Contains(header, currentPath) || strings.Contains(header, oldPath) {
+	if !ok || !strings.Contains(header, strconv.Quote(currentPath)) || strings.Contains(header, strconv.Quote(oldPath)) {
 		t.Fatalf("current archive cannot be discovered from memory header: %q", header)
 	}
-	if !strings.Contains(view[3].Content.(string), oldPath) {
+	if !strings.Contains(view[3].Content.(string), strconv.Quote(oldPath)) {
 		t.Fatal("test did not retain the historical stale tool-report path")
 	}
 	if _, err := os.Stat(currentPath); err != nil {
