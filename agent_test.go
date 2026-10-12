@@ -16,27 +16,14 @@ import (
 	"time"
 )
 
-// ---------- sanitize / ansiRegex ----------
-
-func TestSanitizeEscapesControlTokens(t *testing.T) {
-	for _, tok := range controlTokens {
-		got := sanitize("a" + tok + "b")
-		if strings.Contains(got, tok) {
-			t.Fatalf("token %q not neutralized: %q", tok, got)
-		}
-		if !strings.Contains(got, "\u200b") {
-			t.Fatalf("token %q escaped without zero-width space: %q", tok, got)
-		}
+// API strings are data. Do not silently insert characters into user payloads.
+func TestUserInputPreservesLiteralPayload(t *testing.T) {
+	text := "  <|im_start|> [gMASK] \r\n"
+	if got := buildUserMessage(text, &pendingState{}); got.Content != text {
+		t.Fatalf("payload changed: %#v", got.Content)
 	}
-	if got := sanitize("plain text"); got != "plain text" {
-		t.Fatalf("plain text altered: %q", got)
-	}
-}
-
-func TestAnsiRegexStripsCSISequences(t *testing.T) {
-	in := "\x1b[31mred\x1b[0m \x1b[2J\x1b[1;2H tail"
-	if got := ansiRegex.ReplaceAllString(in, ""); got != "red  tail" {
-		t.Fatalf("unexpected strip: %q", got)
+	if got, err := pipePrompt("instruction", strings.NewReader(text)); err != nil || got != "instruction\n\n"+text {
+		t.Fatalf("pipe payload changed: %q %v", got, err)
 	}
 }
 
@@ -147,7 +134,7 @@ func TestReadLinePipe(t *testing.T) {
 		{"lone cr", "ok\r", "ok", false},
 		{"tab kept", "a\tb\n", "a\tb", false},
 		{"esc sequences dropped", "\x1b[A\x1b[H\x1b[3~ok\n", "ok", false},
-		{"lone esc eats next key", "\x1bXok\n", "ok", false},
+		{"lone esc preserves next key", "\x1bXok\n", "Xok", false},
 		{"control chars dropped", "\x01\x03\x1aok\n", "ok", false},
 		{"backspace byte ignored in pipe mode", "ab\x7fc\n", "abc", false},
 		{"eof with buffer", "abc", "abc", true},
@@ -173,7 +160,7 @@ func TestReadLinePipe(t *testing.T) {
 func TestSystemRules(t *testing.T) {
 	s := systemRules()
 	for _, want := range []string{
-		"SYSTEM: Go runtime", "(9) exec accepts", strconv.Quote(interruptedMarker),
+		"autonomous assistant", "output_file", "live objective", strconv.Quote(interruptedMarker),
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("missing %q in system prompt", want)
@@ -214,8 +201,9 @@ func TestSessionRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("round trip mismatch:\n got %#v\nwant %#v", got, want)
+	t.Cleanup(got.close)
+	if got.messageCount() != want.messageCount() || got.Cursor != want.Cursor || got.Memory != want.Memory || !reflect.DeepEqual(fullTranscript(t, got), fullTranscript(t, want)) {
+		t.Fatalf("round trip mismatch: got count=%d cursor=%d memory=%q", got.messageCount(), got.Cursor, got.Memory)
 	}
 }
 
@@ -256,7 +244,8 @@ func TestLoadSessionV3(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Transcript) != 3 || got.Memory != "notes" || got.Cursor != 2 {
+	t.Cleanup(got.close)
+	if len(got.Transcript) != 2 || got.messageCount() != 3 || got.Memory != "notes" || got.Cursor != 2 {
 		t.Fatalf("v3 fields lost: %+v", got)
 	}
 }
@@ -277,7 +266,7 @@ func TestLoadSessionV3ClampsCursor(t *testing.T) {
 
 func TestLoadSessionLegacyArray(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "s.json")
-	body := `[{"role":"system","content":"you are a pirate"},{"role":"system","content":{"nested":true}}]`
+	body := `[{"role":"system","content":"you are a pirate"},{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}]}]`
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -328,10 +317,11 @@ func TestSaveSessionBadPath(t *testing.T) {
 
 func TestPipePrompt(t *testing.T) {
 	cases := []struct{ name, prompt, stdin, want string }{
-		{"stdin only", "", "hello world\n", "hello world"},
+		{"stdin only", "", "hello world\n", "hello world\n"},
 		{"prompt only", "do it", "", "do it"},
-		{"combined", "do it", "data payload\n", "do it\n\ndata payload"},
-		{"both empty", "", "  \n\t", ""},
+		{"combined", "do it", "data payload\n", "do it\n\ndata payload\n"},
+		{"whitespace data preserved", "", "  \n\t", "  \n\t"},
+		{"both empty", "", "", ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -432,7 +422,7 @@ func TestRunToolErrors(t *testing.T) {
 		t.Fatalf("missing program: %q", r)
 	}
 	r, _ = runTool(ctx, nil, "exec", `{"program":"echo","args":[1]}`)
-	if !strings.Contains(r, "all args elements must be strings") {
+	if !strings.Contains(r, "invalid exec parameter types") {
 		t.Fatalf("bad args: %q", r)
 	}
 	r, _ = runTool(ctx, nil, "exec", `{"program":"echo"}`)
@@ -490,7 +480,7 @@ func TestParseExecParams(t *testing.T) {
 		t.Fatal("missing environ must be nil")
 	}
 
-	if got := buildCmdEnv(nil); got != nil {
+	if got := buildCmdEnv(nil, nil); got != nil {
 		t.Fatal("empty environ must be nil")
 	}
 }
@@ -504,18 +494,6 @@ func TestUnquoteAllStrings(t *testing.T) {
 	list := out["list"].([]interface{})
 	if out["a"] != "x" || list[0] != "y" || list[1] != float64(3) || out["keep"] != "plain" {
 		t.Fatalf("unquote: %#v", out)
-	}
-}
-
-func TestTruncateText(t *testing.T) {
-	if got := truncateText("hello", 0); got != "hello" {
-		t.Fatalf("0 limit: %q", got)
-	}
-	if got := truncateText("hello", 5); got != "hello" {
-		t.Fatalf("exact: %q", got)
-	}
-	if got := truncateText("hello世界", 6); got != "hello世\n...[truncated]" {
-		t.Fatalf("rune boundary cut: %q", got)
 	}
 }
 
@@ -565,7 +543,7 @@ func editTestSession() *Session {
 		Transcript: []Message{
 			{Role: "system", Content: "s"},
 			{Role: "user", Content: "u1"},
-			{Role: "assistant", Content: "a1", ToolCalls: []ToolCall{{ID: "a", Type: "function", Function: FunctionCall{Name: "exec"}}}},
+			{Role: "assistant", Content: "a1", ToolCalls: []ToolCall{{ID: "a", Type: "function", Function: FunctionCall{Name: "exec", Arguments: `{}`}}}},
 			{Role: "tool", ToolCallID: "a", Content: "r"},
 			{Role: "user", Content: "u2"},
 			{Role: "assistant", Content: "a2"},
@@ -574,65 +552,86 @@ func editTestSession() *Session {
 	}
 }
 
+// Compare the portable full history, not the intentionally compact resident tail.
+func fullTranscript(t *testing.T, s *Session) []Message {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "history.session")
+	if err := saveSession(path, s); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var full struct {
+		Transcript []Message `json:"transcript"`
+	}
+	if err := json.Unmarshal(b, &full); err != nil {
+		t.Fatal(err)
+	}
+	return full.Transcript
+}
+
 func TestEditMemory(t *testing.T) {
+	fresh := func(t *testing.T) *Session { s := editTestSession(); t.Cleanup(s.close); return s }
 	t.Run("memory required, state untouched", func(t *testing.T) {
-		s := editTestSession()
+		s := fresh(t)
 		want := append([]Message(nil), s.Transcript...)
 		if r := s.editMemory("  ", 0); !strings.HasPrefix(r, "Error") {
-			t.Fatalf("blank memory must be rejected: %q", r)
+			t.Fatal(r)
 		}
 		if s.Memory != "" || s.Cursor != 1 || !reflect.DeepEqual(s.Transcript, want) {
-			t.Fatalf("rejected call must not touch state: %+v", s)
+			t.Fatal("rejected edit changed state")
 		}
 	})
-	t.Run("cursor omitted keeps window, memory text updated", func(t *testing.T) {
-		s := editTestSession()
-		r := s.editMemory("facts", 0)
-		if s.Cursor != 1 || s.Memory != "facts" || !strings.Contains(r, "Cursor 1 -> 1") {
-			t.Fatalf("cursor must ratchet to current: %+v %q", s, r)
+	t.Run("default compacts completed history", func(t *testing.T) {
+		s := fresh(t)
+		want := fullTranscript(t, s)
+		r := s.editMemory("live goal, constraints and completed facts", 0)
+		if s.Cursor != 6 || len(s.Transcript) != 1 || s.Memory == "" || !strings.Contains(r, "Cursor 1 -> 6") {
+			t.Fatalf("state: %+v result: %s", s, r)
 		}
-		if len(s.contextMessages()) != len(s.Transcript)+1 { // +1: the memory header
-			t.Fatalf("view must show the full transcript plus the header: %+v", s.contextMessages())
+		if !reflect.DeepEqual(fullTranscript(t, s), want) {
+			t.Fatal("archived history changed")
+		}
+		if len(s.contextMessages()) != 2 {
+			t.Fatal("absorbed messages still in context")
 		}
 	})
-	t.Run("advance absorbs into memory, transcript untouched", func(t *testing.T) {
-		s := editTestSession()
-		want := append([]Message(nil), s.Transcript...)
-		r := s.editMemory("u1 and its answer", 4)
+	t.Run("advance preserves disk history and frees resident prefix", func(t *testing.T) {
+		s := fresh(t)
+		want := fullTranscript(t, s)
+		s.editMemory("u1 and its answer; continue u2", 4)
+		if !reflect.DeepEqual(fullTranscript(t, s), want) {
+			t.Fatal("history changed")
+		}
 		assertPairing(t, s.Transcript)
-		if !reflect.DeepEqual(s.Transcript, want) {
-			t.Fatalf("transcript must be append-only: %+v", s.Transcript)
-		}
-		if s.Cursor != 4 {
-			t.Fatalf("cursor: got %d, want 4", s.Cursor)
-		}
 		view := s.contextMessages()
-		mem, _ := view[1].Content.(string)
-		if len(view) != 4 || view[0].Role != "system" || view[1].Role != "system" || !strings.Contains(mem, "u1 and its answer") || view[2].Content != "u2" || view[3].Content != "a2" {
-			t.Fatalf("view wrong: %+v (%q)", view, r)
+		if s.Cursor != 4 || len(s.Transcript) != 3 || len(view) != 4 || view[2].Content != "u2" || view[3].Content != "a2" {
+			t.Fatalf("view: %+v", view)
 		}
 	})
-	t.Run("cursor never lands on a tool result", func(t *testing.T) {
-		s := editTestSession()
-		s.editMemory("facts", 3) // Transcript[3] is a tool result
-		if s.Cursor != 4 || s.Transcript[4].Role != "user" {
-			t.Fatalf("cursor must skip forward to a safe boundary: %d", s.Cursor)
+	t.Run("cursor does not split tool results", func(t *testing.T) {
+		s := fresh(t)
+		s.editMemory("facts", 3)
+		if s.Cursor != 4 || s.Transcript[s.residentCursor()].Role != "user" {
+			t.Fatal("unsafe tool boundary")
 		}
 	})
-	t.Run("one-way ratchet", func(t *testing.T) {
-		s := editTestSession()
-		s.editMemory("facts", 4)
-		s.editMemory("more", 2)
-		if s.Cursor != 4 {
-			t.Fatalf("cursor must never decrease: %d", s.Cursor)
+	t.Run("stale cursor cannot overwrite newer snapshot", func(t *testing.T) {
+		s := fresh(t)
+		s.editMemory("newer facts", 4)
+		r := s.editMemory("stale facts", 2)
+		if !strings.HasPrefix(r, "Error") || s.Cursor != 4 || s.Memory != "newer facts" {
+			t.Fatalf("stale snapshot applied: %s", r)
 		}
 	})
-	t.Run("current turn protected", func(t *testing.T) {
-		s := editTestSession()
-		s.Transcript = append(s.Transcript, Message{Role: "user", Content: "u3"})
-		s.editMemory("facts", 99)
-		if s.Cursor != 6 { // lastUserIndex: u3 sits at 6
-			t.Fatalf("cursor must clamp to the newest user message: %d", s.Cursor)
+	t.Run("pending tool group stays visible", func(t *testing.T) {
+		s := fresh(t)
+		s.Transcript = append(s.Transcript, Message{Role: "user", Content: "u3"}, Message{Role: "assistant", ToolCalls: []ToolCall{{ID: "pending", Type: "function", Function: FunctionCall{Name: "memory_edit", Arguments: `{"memory":"continue u3"}`}}}})
+		s.editMemory("continue u3", 99)
+		if s.Cursor != 7 || len(s.contextMessages()) != 3 || s.contextMessages()[2].Role != "assistant" {
+			t.Fatal("pending group removed")
 		}
 	})
 }
@@ -649,7 +648,7 @@ func TestContextMessages(t *testing.T) {
 	if len(v) != 3 {
 		t.Fatalf("no memory header while Memory is empty: %+v", v)
 	}
-	s.editMemory("durable facts", 0)
+	s.editMemory("durable facts", 1)
 	v = s.contextMessages()
 	mem, _ := v[1].Content.(string)
 	if len(v) != 4 || v[1].Role != "system" || !strings.Contains(mem, "durable facts") {

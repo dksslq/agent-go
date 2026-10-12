@@ -18,7 +18,10 @@ jobs:
           go-version: 'stable'
 
       - name: verify
-        run: go vet ./... && go test -count=1 .
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test -count=1 -race -shuffle=on .
 
       - name: cross-compile
         run: |
@@ -43,9 +46,21 @@ jobs:
           sed -i "1s/([^)]*)/(${VER}-1)/" "/tmp/${N}-${VER}/debian/changelog"
           tar -C /tmp -czf "/tmp/${N}_${VER}.orig.tar.gz" "${N}-${VER}"
           (cd "/tmp/${N}-${VER}" && dpkg-buildpackage -us -uc -b)
-          cp /tmp/${N}_${VER}_amd64.deb dist/
+          DEBVER=$(dpkg-parsechangelog -l "/tmp/${N}-${VER}/debian/changelog" -S Version)
+          cp "/tmp/${N}_${DEBVER}_amd64.deb" dist/
+
+      - name: artifact checksums
+        working-directory: dist
+        run: sha256sum agent-go-* agentlet_*.deb > SHA256SUMS
 
       - name: publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
+        run: |
+          notes="docs/release-${GITHUB_REF_NAME}.md"
+          if [ -f "$notes" ]; then
+            gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$notes"
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+          fi
+          gh release edit "$GITHUB_REF_NAME" --draft=false

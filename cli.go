@@ -1,0 +1,316 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net/url"
+	"os"
+	"os/signal"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+func main() { os.Exit(run(os.Args[1:])) }
+
+// Keep exit decisions outside resource-owning code, so terminal restoration,
+// archive cleanup and HTTP cleanup run on errors and signals too.
+func run(args []string) (status int) {
+	defer func() {
+		if r := recover(); r != nil {
+			infof("Panic: %v\n", r)
+			status = 1
+		}
+	}()
+	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
+	prompt := fs.String("prompt", "", "User prompt")
+	once := fs.Bool("once", false, "Process -prompt once and exit")
+	pipe := fs.Bool("pipe", false, "Read stdin as data; combine with -prompt; implies -once")
+	load := fs.String("load", "", "Load an existing session")
+	save := fs.String("save", "", "Checkpoint session after each tool round and turn")
+	resume := fs.String("continue", "", "Load if present and checkpoint to the same file")
+	fs.BoolVar(&verbose, "verbose", false, "Show reasoning, tool arguments and tool results on stderr")
+	fs.StringVar(&apiBase, "api-base", envDefault("AGENT_API_BASE", "http://localhost:8080/v1"), "API base URL; default from AGENT_API_BASE")
+	fs.StringVar(&apiKey, "api-key", os.Getenv("AGENT_API_KEY"), "API key; default from AGENT_API_KEY")
+	fs.StringVar(&modelName, "model", os.Getenv("AGENT_MODEL"), "Model name; default from AGENT_MODEL")
+	fs.StringVar(&reasoningField, "reasoning-field", "reasoning_content", "Reasoning delta field")
+	fs.StringVar(&contentField, "content-field", "content", "Content delta field")
+	fs.StringVar(&toolCallsField, "tool-calls-field", "tool_calls", "Tool-call delta field")
+	fs.StringVar(&finishReasonField, "finish-reason-field", "finish_reason", "Choice finish field")
+	fs.IntVar(&httpMaxIdleConns, "http-max-idle-conns", 100, "Maximum retained idle HTTP connections")
+	fs.DurationVar(&httpIdleTimeout, "http-idle-timeout", 5*time.Minute, "Idle HTTP connection lifetime")
+	fs.DurationVar(&streamIdleTimeout, "stream-idle-timeout", 5*time.Minute, "Network inactivity timeout; 0 disables it")
+	fs.DurationVar(&streamIdleTimeout, "tool-call-idle-timeout", 5*time.Minute, "Alias for -stream-idle-timeout")
+	fs.Func("extra", "Base64 JSON object merged into the API request; repeatable", func(s string) error {
+		b, err := base64.StdEncoding.DecodeString(s)
+		if err != nil {
+			return fmt.Errorf("invalid base64 for -extra: %w", err)
+		}
+		var obj map[string]interface{}
+		if err := json.Unmarshal(b, &obj); err != nil || obj == nil {
+			return errors.New("-extra must decode to a JSON object")
+		}
+		extraRequestFields = append(extraRequestFields, obj)
+		return nil
+	})
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 1
+	}
+	apiBase = strings.TrimRight(apiBase, "/")
+	u, err := url.Parse(apiBase)
+	if modelName == "" || fs.NArg() != 0 || (*once && *prompt == "" && !*pipe) {
+		infof("Error: specify a model and provide -prompt with -once (or use -pipe)\n")
+		return 1
+	}
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		infof("Error: -api-base must be an HTTP(S) base URL without credentials, query or fragment\n")
+		return 1
+	}
+	if streamIdleTimeout < 0 || httpIdleTimeout < 0 || httpMaxIdleConns < 0 {
+		infof("Error: timeouts and idle connection count must be nonnegative\n")
+		return 1
+	}
+	ctx, shutdown := context.WithCancel(context.Background())
+	defer shutdown()
+	stdoutWriter = newOutputWriter(ctx, os.Stdout)
+	stderrWriter = newOutputWriter(ctx, os.Stderr)
+	var signalStatus atomic.Int32
+	autonomous := *once || *pipe
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	go func() {
+		for {
+			select {
+			case sig := <-signals:
+				if sig == os.Interrupt {
+					if cancel := interruptMgr.take(); cancel != nil && !autonomous {
+						cancel()
+						continue
+					}
+					signalStatus.Store(130)
+				} else {
+					signalStatus.Store(143)
+				}
+				shutdown()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	failureStatus := func(err error) int {
+		if code := signalStatus.Load(); code != 0 {
+			return int(code)
+		}
+		if errors.Is(err, context.Canceled) {
+			return 130
+		}
+		if err != nil {
+			return 1
+		}
+		return 0
+	}
+	if *pipe {
+		p, err := readInput(ctx, func() (string, error) { return pipePrompt(*prompt, os.Stdin) })
+		if err != nil {
+			infof("Error reading stdin: %v\n", err)
+			return failureStatus(err)
+		}
+		if p == "" {
+			infof("Error: -pipe requires stdin data or -prompt\n")
+			return 1
+		}
+		*prompt, *once = p, true
+	}
+	httpClient = newHTTPClient()
+	defer httpClient.CloseIdleConnections()
+	// Autonomous runs never alter terminal state or put prompts on stdout.
+	if !*once {
+		out, _ := os.Stdout.Stat()
+		if out != nil && out.Mode()&os.ModeCharDevice != 0 {
+			if old, err := makeRaw(int(os.Stdin.Fd())); err == nil {
+				termRaw, termFd, termOld = true, int(os.Stdin.Fd()), old
+				defer restoreTerm(termFd, termOld)
+			}
+		}
+	}
+	loadFile, saveFile, strictLoad := *load, *save, *load != ""
+	if *resume != "" {
+		if loadFile == "" {
+			loadFile, strictLoad = *resume, false
+		}
+		if saveFile == "" {
+			saveFile = *resume
+		}
+	}
+	sess := newSession()
+	defer func() { sess.close() }()
+	if loadFile != "" {
+		loaded, err := loadSession(loadFile)
+		switch {
+		case err == nil && loaded != nil:
+			sess = loaded
+		case err == nil:
+			infof("Error loading session: existing session file is empty\n")
+			return 1
+		case errors.Is(err, os.ErrNotExist) && !strictLoad:
+		default:
+			infof("Error loading session: %v\n", err)
+			return 1
+		}
+	}
+	sess.saveFile = saveFile
+	showSystemPrompt(sess.Transcript)
+	turn := func(msg Message) error {
+		before := len(sess.Transcript)
+		beforeCount := sess.messageCount()
+		sess.Transcript = append(sess.Transcript, msg)
+		infCtx, cancel := context.WithCancel(ctx)
+		interruptMgr.set(cancel)
+		err := runInferenceLoop(infCtx, sess)
+		cancel()
+		interruptMgr.clear()
+		if err != nil && sess.messageCount() == beforeCount+1 {
+			sess.Transcript = sess.Transcript[:before]
+		} else {
+			clearPending()
+		}
+		if saveFile != "" {
+			if saveErr := saveSession(saveFile, sess); saveErr != nil {
+				err = errors.Join(err, fmt.Errorf("checkpoint failed: %w", saveErr))
+			}
+		}
+		if err != nil {
+			infof("Runtime error: %v\n", err)
+		}
+		return err
+	}
+	if *prompt != "" {
+		err := turn(Message{Role: "user", Content: *prompt})
+		status = failureStatus(err)
+		if *once || ctx.Err() != nil {
+			return status
+		}
+	}
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		if termRaw {
+			put("\r> ")
+		}
+		input, err := readInput(ctx, func() (string, error) { return readLine(reader) })
+		if err != nil && !errors.Is(err, io.EOF) {
+			infof("Input error: %v\n", err)
+			return failureStatus(err)
+		}
+		input = strings.TrimSpace(input)
+		if input == "" {
+			if err == io.EOF {
+				return status
+			}
+			continue
+		}
+		if input == "exit" || input == "quit" {
+			return status
+		}
+		if handleCommand(input, &sess, saveFile) {
+			continue
+		}
+		status = failureStatus(turn(buildUserMessage(input, &pending)))
+		if ctx.Err() != nil {
+			return failureStatus(ctx.Err())
+		}
+	}
+}
+
+func envDefault(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
+}
+
+// One outstanding stdin read at most. On shutdown the process returns through
+// its defers and exits; stdin stays open until terminal restoration completes.
+func readInput(ctx context.Context, read func() (string, error)) (string, error) {
+	type result struct {
+		text string
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() { text, err := read(); ch <- result{text, err} }()
+	select {
+	case r := <-ch:
+		return r.text, r.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func handleCommand(input string, sess **Session, saveFile string) bool {
+	cmd, arg, _ := strings.Cut(input, " ")
+	arg = strings.TrimSpace(arg)
+	switch cmd {
+	case "/help":
+		printHelp()
+	case "/pending":
+		showPending()
+	case "/clear":
+		clearPending()
+		put("Pending media cleared.\n")
+	case "/memory":
+		showMemory(*sess)
+	case "/image", "/image-url":
+		if arg == "" {
+			putf("Usage: %s <path or URL>\n", cmd)
+			break
+		}
+		uri := arg
+		if cmd == "/image" {
+			var err error
+			uri, _, err = readImage(arg)
+			if err != nil {
+				putf("Image error: %v\n", err)
+				break
+			}
+		}
+		pending.images = append(pending.images, ContentBlock{Type: "image_url", ImageURL: &ImageURL{URL: uri, Detail: "auto"}})
+		putf("Image appended (%d pending).\n", len(pending.images))
+	case "/save", "/reload":
+		if arg == "" {
+			putf("Usage: %s <filename>\n", cmd)
+			break
+		}
+		if cmd == "/save" {
+			if err := saveSession(arg, *sess); err != nil {
+				putf("Save failed: %v\n", err)
+			} else {
+				put("Session saved.\n")
+			}
+			break
+		}
+		loaded, err := loadSession(arg)
+		if err != nil || loaded == nil {
+			putf("Reload failed: %v (session must be nonempty)\n", err)
+			break
+		}
+		(*sess).close()
+		*sess = loaded
+		loaded.saveFile = saveFile
+		clearPending()
+		showSystemPrompt(loaded.Transcript)
+		put("Session reloaded.\n")
+	default:
+		return false
+	}
+	return true
+}

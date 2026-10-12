@@ -20,20 +20,20 @@ func withStreamDefaults(t *testing.T) {
 	oldAPI, oldKey, oldModel := apiBase, apiKey, modelName
 	oldR, oldC, oldTC, oldFR := reasoningField, contentField, toolCallsField, finishReasonField
 	oldExtra, oldClient := extraRequestFields, httpClient
-	oldIdle := toolCallIdleTimeout
+	oldIdle := streamIdleTimeout
 
 	apiKey, modelName = "test-key", "test-model"
 	reasoningField, contentField, toolCallsField, finishReasonField =
 		"reasoning_content", "content", "tool_calls", "finish_reason"
 	extraRequestFields = nil
 	httpClient = &http.Client{}
-	toolCallIdleTimeout = time.Minute
+	streamIdleTimeout = time.Minute
 
 	t.Cleanup(func() {
 		apiBase, apiKey, modelName = oldAPI, oldKey, oldModel
 		reasoningField, contentField, toolCallsField, finishReasonField = oldR, oldC, oldTC, oldFR
 		extraRequestFields, httpClient = oldExtra, oldClient
-		toolCallIdleTimeout = oldIdle
+		streamIdleTimeout = oldIdle
 	})
 }
 
@@ -222,7 +222,7 @@ func TestChatStreamDoneStopsReading(t *testing.T) {
 	assertEvents(t, evs, []StreamEvent{{Type: EventToken, Text: "a"}})
 }
 
-func TestChatStreamFlushPendingOnEOF(t *testing.T) {
+func TestChatStreamRejectsPendingOnEOF(t *testing.T) {
 	withStreamDefaults(t)
 	withSSEServer(t, func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, toolCallChunk(t, 0, "a1", "exec", `{"program":"ls"}`))
@@ -231,8 +231,13 @@ func TestChatStreamFlushPendingOnEOF(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(evs) == 0 || evs[len(evs)-1].Type != EventToolCalls {
-		t.Fatalf("pending tools must flush at EOF: %+v", evs)
+	if len(evs) == 0 || evs[len(evs)-1].Type != EventError {
+		t.Fatalf("an incomplete response must fail instead of executing pending tools: %+v", evs)
+	}
+	for _, event := range evs {
+		if event.Type == EventToolCalls {
+			t.Fatalf("truncated response emitted executable calls: %+v", evs)
+		}
 	}
 }
 
@@ -242,7 +247,6 @@ func TestChatStreamSkipsGarbageLines(t *testing.T) {
 		io.WriteString(w,
 			"event: ping\n\n"+
 				": keepalive\n\n"+
-				"data: {bad json\n\n"+
 				sseData(`{"choices":[]}`)+
 				deltaChunk(t, map[string]interface{}{contentField: "ok"}, "")+
 				sseData("[DONE]"))
@@ -467,17 +471,22 @@ func TestMemoryEditEndToEnd(t *testing.T) {
 		t.Fatalf("unexpected report: %q", tr.Result)
 	}
 
-	// P0: the transcript is append-only — absorbed messages stay on it verbatim.
-	if len(sess.Transcript) != 7 {
+	// Compaction releases RAM, while portable history preserves every message.
+	t.Cleanup(sess.close)
+	if len(sess.Transcript) != 5 || sess.messageCount() != 7 {
+		t.Fatalf("compacted prefix retained or duplicated: resident=%d logical=%d", len(sess.Transcript), sess.messageCount())
+	}
+	full := fullTranscript(t, sess)
+	if len(full) != 7 {
 		t.Fatalf("transcript = %d messages, want 7 (4 original + tool pair + final answer)", len(sess.Transcript))
 	}
-	if fmt.Sprint(sess.Transcript[1].Content) != "hi" ||
-		fmt.Sprint(sess.Transcript[2].Content) != "hello" ||
-		fmt.Sprint(sess.Transcript[3].Content) != "organize" {
+	if fmt.Sprint(full[1].Content) != "hi" ||
+		fmt.Sprint(full[2].Content) != "hello" ||
+		fmt.Sprint(full[3].Content) != "organize" {
 		t.Fatalf("transcript must never be rewritten: %+v", sess.Transcript)
 	}
-	if !strings.Contains(fmt.Sprint(sess.Transcript[6].Content), "done") {
-		t.Fatalf("final answer missing from transcript: %+v", sess.Transcript[6])
+	if !strings.Contains(fmt.Sprint(full[6].Content), "done") {
+		t.Fatalf("final answer missing from transcript: %+v", full[6])
 	}
 	if sess.Memory != "user greeted; agent said hello; user asked to organize" || sess.Cursor != 3 {
 		t.Fatalf("session state: memory=%q cursor=%d", sess.Memory, sess.Cursor)

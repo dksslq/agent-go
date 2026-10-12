@@ -16,9 +16,8 @@ var (
 )
 
 const (
-	enableEchoInput      = 0x0004
-	enableLineInput      = 0x0002
-	enableProcessedInput = 0x0001
+	enableEchoInput = 0x0004
+	enableLineInput = 0x0002
 )
 
 func makeRaw(fd int) (interface{}, error) {
@@ -28,7 +27,9 @@ func makeRaw(fd int) (interface{}, error) {
 	if r == 0 {
 		return nil, fmt.Errorf("getconsolemode: %v", err)
 	}
-	newMode := oldMode &^ (enableEchoInput | enableLineInput | enableProcessedInput)
+	// Keep processed input enabled: Windows must deliver Ctrl+C to the signal
+	// handler instead of returning an ETX byte that line input would discard.
+	newMode := oldMode &^ (enableEchoInput | enableLineInput)
 	r, _, err = procSetConsoleMode.Call(uintptr(handle), uintptr(newMode))
 	if r == 0 {
 		return nil, fmt.Errorf("setconsolemode: %v", err)

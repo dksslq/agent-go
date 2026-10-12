@@ -1,3 +1,13 @@
+agentlet (2.1.0-1) unstable; urgency=medium
+
+  * Audit autonomous execution: correct exit status, signals and checkpoints.
+  * Validate SSE completion, retain proxy/TLS defaults, configure idle timeout.
+  * Reap processes, cancel Unix process groups, drain previews without killing.
+  * Archive compacted history outside RAM; preserve complete v3 sessions.
+  * Add opt-in raw output files, regression tests and accurate documentation.
+
+ -- dksslq <dksslq@users.noreply.github.com>  Mon, 12 Oct 2026 12:00:00 +0000
+
 agentlet (2.0.0-1) unstable; urgency=medium
 
   * Upstream v2.0: immutable append-only transcript + model-maintained

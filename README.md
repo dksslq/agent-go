@@ -1,283 +1,153 @@
-<div align="center">
+# agent-go
 
-# ⚡ agent-go
+一个小型终端 AI Agent：单二进制，只用 Go 标准库。连接 OpenAI 兼容的 Chat Completions API，通过三个工具执行程序、读取图片和整理记忆。
 
-**一个单二进制、零依赖的终端 AI Agent —— ~1700 行纯 Go（标准库，核心三个文件）**
+[![CI](https://github.com/dksslq/agent-go/actions/workflows/ci.yml/badge.svg)](https://github.com/dksslq/agent-go/actions/workflows/ci.yml) · [Releases](https://github.com/dksslq/agent-go/releases) · [MIT](LICENSE)
 
-流式输出 · 工具调用 · 多模态 · 记忆自整理 · 会话持久化 · 跨平台
+支持 Linux、macOS、Windows 的 amd64 / arm64。构建需要 Go 1.21+，无第三方依赖，无 cgo。
 
-[![Go](https://img.shields.io/badge/Go-1.21%2B-00ADD8?logo=go&logoColor=white)](#-快速开始)
-[![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#-快速开始)
-[![Deps](https://img.shields.io/badge/third--party%20deps-zero-3fb950)](#-特性)
-[![Tests](https://img.shields.io/badge/tests-44%20pass%20%C2%B7%200%20test%20deps-3fb950)](#-测试与质量)
-[![License](https://img.shields.io/badge/license-MIT-green)](#-许可)
-[![Designed by](https://img.shields.io/badge/designed%20by-DeepSeek%20%C3%97%20GLM-ff7b72)](#-designed-by-deepseek--glm)
-[![CI](https://github.com/dksslq/agent-go/actions/workflows/ci.yml/badge.svg)](https://github.com/dksslq/agent-go/actions/workflows/ci.yml)
-
-<img src="docs/demo.svg" alt="agent-go 终端演示：流式回复、工具调用、会话持久化" width="820"/>
-
-</div>
-
----
-
-## ✨ 特性
-
-| | |
-|---|---|
-| 🪶 **轻到极致** | 核心就三个文件：`agent.go` + `openai.go` + `memory.go`（共 ~1700 行），**只用 Go 标准库、零第三方依赖、无 cgo**，交叉编译产出单文件二进制 |
-| 🌊 **真流式** | SSE 逐 token 输出；`-reasoning-field` 等 4 个 delta 字段名可映射，**原生兼容 DeepSeek-R1 等推理模型**，思考流与正文分流呈现 |
-| 🔧 **工具调用** | `exec`（stdin 注入 / 超时 / 后台 detach / cwd / 环境注入 / 输出限长）、`image_read`、`memory_edit`；**同轮多工具并行执行** |
-| 🖼 **多模态** | `/image` `/image-url` 附件随下一条消息发送——让模型看得见图 |
-| 🧠 **记忆自整理** | transcript 只追加、永不改写：模型用 `memory_edit` 维护自己的语义记忆快照 + 单向游标——旧轮离开可见上下文但**原文永久留档**，`tool_calls`/`tool` 配对与时间顺序在结构上不可能破坏 |
-| 💾 **会话持久化** | `-save` / `-load` / `-continue` 一键续聊，`/save` `/reload` 在线切换；v3 格式（transcript + memory + cursor）单文件原子落盘（tmp + rename），crash 撕不出半个 JSON |
-| ⌨️ **终端原生** | raw mode 行内编辑（退格即见即所得）；**Ctrl+C 中断当前推理轮、再按退出**；转义序列安全吞除——方向键 / Home / Delete 不会污染输入（有 PTY 实测背书） |
-| 🤖 **全自主可编排** | 人机模式与全自主模式同一二进制：`-once` 内联一句话，`-pipe` 让 stdin 成为数据流——stdin 进、stdout 出、处理完即退、退出码可编排；**并发就是 N 个 OS 进程**，xargs / cron / systemd 任意编排 |
-| 🛡 **防御性默认** | 无轮次上限（模型自主决定何时收手，空闲超时兜底）、SIGKILL 后 `WaitDelay` 强制回收防挂死、panic 恢复并自动还原终端状态；限制交给 OS 与外部机制，不内置硬天花板 |
-| 🔌 **即插即用** | 直连任何 **OpenAI 兼容 API**（GLM / DeepSeek / OpenAI / vLLM / Ollama…）；`-extra` 以 Base64 注入任意 JSON 请求字段，厂商私有参数全兼容 |
-
-## 🎯 适用环境与安全模型
-
-**为受信任的本地环境设计**：个人开发机、工业生产内网主机、封闭运维终端——你合法拥有、且有必要让模型直接操作这台机器的场景。
-
-**agent 本身零权限限制**：`exec` 运行任意程序、继承进程的完整 OS 权限——无沙箱、无白名单、无确认弹窗。这是刻意的最小设计：权限决策交给使用者与外部机制，而不是内置一套可被提示词绕过的伪防线（提示词层只做一件事：声明工具输出不可信，防注入指令）。
-
-**限制必须来自外部**——与对待 shell 完全同理：
-
-| 层 | 手段 |
-|---|---|
-| OS | 专用低权用户运行；按需收敛文件系统权限 |
-| 隔离 | 容器 / namespace / chroot / 独立虚拟机 |
-| 网络 | 防火墙收敛出站（程序自身只需访问模型 API 一条） |
-
-> 把 agentlet 当作 shell 的等价物：它不是玩具，也不要让它接触不可信来源的输入。
-
-## 🤖 自主模式与并发生产
-
-同一二进制，两种形态：
-
-| 形态 | 入口 | 特征 |
-|---|---|---|
-| **人机协作** | 直接运行 | raw mode 交互、Ctrl+C 中断、`/` 命令、会话续聊 |
-| **全自主** | `-once` / `-pipe` | 无终端假设：stdin 进、stdout 出、处理完即退、退出码可编排 |
-
-`-pipe` 让 agentlet 成为标准 Unix 过滤器——`-prompt` 是指令，stdin 是数据：
+## 安装与运行
 
 ```bash
-cat error.log | agentlet -model glm-4.7 -api-base https://api.z.ai/api/paas/v4 -api-key "$ZAI_API_KEY" \
-        -pipe -prompt "定位根因，给出修复命令"
-
-agentlet -model glm-4.7 -api-base https://api.z.ai/api/paas/v4 -api-key "$ZAI_API_KEY" \
-        -pipe < task.md > result.md
+go install github.com/dksslq/agent-go@latest
 ```
 
-**输出纪律**：stdin 非终端（管道 / 重定向）时，stdout 只有模型输出，启动信息与错误全部走 stderr；退出码 `0` 正常 / `1` 出错 / `130` 被中断——三种身份都能被脚本直接消费。
-
-**并发就是进程**，刻意不内置线程池与队列：N 个 agentlet = N 个 OS 进程，交给久经考验的 Unix 编排器，无共享状态、无锁、崩溃互不传染——
+也可以从 [Release](https://github.com/dksslq/agent-go/releases) 下载对应平台的二进制。Debian / Ubuntu 的包名为 `agentlet`，安装后命令为 `agentlet`；Go 安装后的命令为 `agent-go`。
 
 ```bash
-# 100 个任务、8 路并行，每路一个自治 agent
-ls tasks/*.md | xargs -P 8 -I{} sh -c 'agentlet -model glm-4.7 -api-base https://api.z.ai/api/paas/v4 \
-        -api-key "$ZAI_API_KEY" -pipe < {} > {}.out'
-```
-
-适合放进去的场景：**cron / CI 步骤 / systemd timer 里的自治工人**，**工业内网数据管道的加工工序**，**xargs · make -j 式批量并行分片**。配合 `-continue` 断点续跑；配合逐字节恒定的系统提示词吃满模型端前缀缓存——大规模并发运行的计费最优解。
-
-> 人机模式让人掌舵，自主模式让机器干活——并发与容错交给操作系统，这是 Unix 的做法。
-
-## 🔭 场景推演：当模型足够可靠
-
-下面只做推演，不跑分：**用到的原语今天全部存在**，唯一变量是模型的可靠性。每项"未来能力"都对应一个现有机制——
-
-| 愿景里的说法 | 今天就有的原语 |
-|---|---|
-| 主 agent 自主控制并发 | `exec` 本来就能启动任意程序——包括再启动 N 个 `agentlet -pipe` 子代理 |
-| 主 agent 记忆 | `-continue` 的会话文件就是磁盘上的纯 JSON（v3：transcript + memory + cursor），主 agent 可用 `exec` 读写自己的记忆；同会话内 `memory_edit` 已把"整理"做成原生工具，且 transcript 永不覆盖 |
-| 侧 agent 压缩对话 | 会话 JSON 管道给侧 agentlet 摘要，校验后原子替换回主会话 |
-| 重生 | systemd `Restart=on-failure` / cron 重拉，`-continue` 从最近一轮自动存档续跑 |
-| 自治 | 退出码 + 每轮自动存档 + 纯净 stdout（自主模式 stdout 只有模型输出，其余走 stderr） |
-
-### 例子：工厂班次交付与报表（流程描述，非跑分）
-
-一台内网主机、一个低权用户、一个 systemd timer：
-
-```ini
-# /etc/systemd/system/shift-report.timer
-[Timer]
-OnCalendar=*-*-* 06:00
-
-[Install]
-WantedBy=timers.target
-```
-
-```ini
-# /etc/systemd/system/shift-report.service
-[Service]
-Type=oneshot
-User=agentlet
-EnvironmentFile=/etc/agentlet/shift.env
-ExecStart=/usr/bin/agentlet -model ${MODEL} -api-base ${API_BASE} -api-key ${API_KEY} \
-          -continue /var/lib/agentlet/shift.session \
-          -pipe -prompt "新班次开始。读取队列任务，全部完成后生成交付报表。"
-Restart=on-failure
-RestartSec=30
-```
-
-发生了什么（每一步都是上表中的原语）：
-
-1. **06:00 systemd 拉起主 agent**：`-pipe` 把当日任务队列表作为数据注入，`-continue` 载入昨天的会话——这就是主 agent 的长期记忆；
-2. 主 agent 用 `exec` 读到产线系统导出的本地 CSV 后，**自己决定分片与并发**（例如 `ls /data/line*.csv | xargs -P 3 -I{} … agentlet -pipe < {} > {}.summary`）——分几路、怎么分，是模型在会话里定的，不是框架定的；
-3. 收齐侧 agent 摘要后生成交付报表写入 `/srv/reports/`，投递走主机上已有通道（邮件 / 内部网关）——agentlet 自身只有模型 API 一条网络连接，grep 可审计；
-4. **进程夜间被杀也没关系**：`Restart=on-failure` 重拉，`-continue` 从最近一轮自动存档继续，已完成的轮次不重做——这就是重生；
-5. 会话越长越贵：主 agent 定期把 `shift.session` 管道给一个侧 agentlet 压缩成最小状态（"保留目标、未完成事项、关键事实，只输出 JSON 数组"），`python3 -m json.tool` 校验通过后原子替换——这就是侧 agent 压缩对话；上下文不无限膨胀，前缀缓存依然命中。
-
-护栏全在进程外（见「适用环境与安全模型」）：低权用户、报表目录最小写权限、出站防火墙只放行模型 API。这套流程今天就能部署——**它能不能跑得稳，取决于模型的可靠性；而这正是 agentlet 被设计成"无魔法、可 grep、可重生"的原因：把不可靠的部件，放进一个可观察、可重生、权限受控的骨架里。**
-
-## 🚀 快速开始
-
-**安装**
-
-| 方式 | 说明 |
-|---|---|
-| Go | `go install github.com/dksslq/agent-go@latest`（Go 1.21+，秒级构建） |
-| Debian / Ubuntu | Release 页下载 `.deb` → `apt install ./agentlet_*_amd64.deb`（**Debian 包名 agentlet**——nano-sized 的终端 agent，二进制 `/usr/bin/agentlet`） |
-| 源码 | `git clone` → `go build -o agent .` |
-
-> 命名：同域检索发现 "nano-agent" 已被占用（GitHub MCP Server / PyPI 同名包），故取 **agentlet**（agent + -let，piglet / droplet 同构）；"nano" 保留为描述词。
-
-**运行**
-
-```bash
-# 交互模式（-continue 自动续档 + 存档）
-./agent -model glm-4.7 \
-        -api-base https://api.z.ai/api/paas/v4 \
-        -api-key  "$ZAI_API_KEY" \
-        -continue dev.session
-
-# 一次性提问（脚本友好）
-./agent -model glm-4.7 -api-base https://api.z.ai/api/paas/v4 \
-        -api-key "$ZAI_API_KEY" \
-        -prompt "用一句话介绍你自己" -once
-
-# 全自主管道：-prompt 为指令，stdin 为数据，处理完即退
-cat error.log | ./agent -model glm-4.7 -api-base https://api.z.ai/api/paas/v4 \
-        -api-key "$ZAI_API_KEY" \
-        -pipe -prompt "定位根因，给出修复命令"
-```
-
-## ⌨️ 交互命令与按键
-
-| 命令 | 作用 |
-|---|---|
-| `/image <path>` / `/image-url <url>` | 追加图片到下一条消息 |
-| `/memory` | 查看语义记忆、游标与上下文体积（字节） |
-| `/pending` · `/clear` | 查看 / 清空待发媒体 |
-| `/save <file>` · `/reload <file>` | 保存 / 重载会话 |
-| `exit` · `quit` · `Ctrl+D` | 结束会话 |
-
-| 按键 | 行为 |
-|---|---|
-| `Ctrl+C`（推理中） | 中断当前轮，已生成内容与 tool_calls 成对入档 |
-| `Ctrl+C`（空闲时） | 退出（退出码 130） |
-| `Backspace` | 删除上一个字符（raw mode 实时回显） |
-| 方向键 / Home / End / Delete | 安全吞除，不污染输入 ✅ |
-
-## 🧰 内置工具
-
-| 工具 | 能力 |
-|---|---|
-| `exec` | 启动任意程序并向 **stdin 写入字符串**；必填 `timeout_seconds`；支持 `cwd`、`environ`、`max_output_chars` 截断、`detach` 后台运行、`unquote_arguments` / `quote_result` 转义控制 |
-| `image_read` | 读取本地图片 → base64 data URI，模型直接"看图" |
-| `memory_edit` | 模型自主维护语义记忆：`memory`（快照全文）+ `cursor`（单向游标，当前轮与 tool 边界受保护）；被吸收的轮次原样留在 transcript 与存档中，永不丢失 |
-
-## ⚙️ 参数一览
-
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `-model` | （必填） | 模型名 |
-| `-api-base` | `http://localhost:8080/v1` | OpenAI 兼容 API 地址 |
-| `-api-key` | 空 | API Key |
-| `-prompt` / `-once` | — | 非交互单问；`-once` 处理完即退 |
-| `-pipe` | — | 读取 stdin 至 EOF 作为提示词内容；与 `-prompt` 组合（指令 + 空行 + 数据）；隐含 `-once` |
-| `-load` / `-save` / `-continue` | — | 启动载入 / 逐轮自动存档 / 续聊（同一文件自动双向） |
-| `-reasoning-field` `-content-field` `-tool-calls-field` `-finish-reason-field` | `reasoning_content` 等 | 流式 delta 字段名映射，适配不同厂商 |
-| `-tool-call-idle-timeout` | `5m` | 工具参数流空闲超时（防模型断流挂死） |
-| `-extra` | 可重复 | Base64(JSON) 合并进请求体，私有参数全兼容 |
-
-## 🔒 安全与审计
-
-两条硬约束**可 grep 复核**：
-
-- **网络**：程序自身仅 `openai.go` 的 `chatStream` 访问模型 API（`apiBase + "/chat/completions"`），无任何其他网络请求；
-- **文件**：仅 `readImage`（工具用，agent.go）与 `saveSession` / `loadSession`（会话存档，memory.go，tmp + rename 原子替换）读写文件，无其他 IO。
-
-```bash
-rg -n 'http\.' openai.go              # 网络面：只有 openai.go 的 chatStream
-rg -n 'os\.(Open|OpenFile|ReadFile)' agent.go memory.go   # 文件面：只有媒体与会话
-```
-
-## 🧪 测试与质量
-
-全部测试仅用标准库 `testing` + `httptest`，**零测试依赖**，`go test .` 一条命令全跑：
-
-| 套件 | 用例 | 覆盖 | 平台 |
-|---|---|---|---|
-| `agent_test.go` | 28 函数 | 会话 v3 round-trip / **legacy 扁平数组兼容** / **tmp+rename 原子存档**；**系统提示词字节恒定守卫**；`-pipe` 语义；**execCmd 真实进程端到端**（合流 / stdin 注入 / 超时击杀 / **孙进程持管道不挂死** / 截断 / cwd / environ / 非零退出 / detach）；runTool 分发与错误路径；参数解析；用户消息组装；**memory_edit 真值表**（必填 / 缺省游标 / 前进吸收且 transcript 不动 / 不落 tool 结果 / 单向棘轮 / 当前轮保护）；**前缀缓存契约测试**（追加 = 上一请求字节前缀扩展） |
-| `sse_test.go` | 13 函数 | SSE 全链路（httptest 假端点）：reasoning / content 分流；tool_calls 分片累积 / finish 触发 / EOF 兜底；自定义字段映射；坏行跳过；API 错误；断连；ctx 取消；请求形状；**多轮工具循环端到端**；**memory_edit 端到端：两轮请求体对照——第二轮只见 [system, 记忆头, cursor 之后]，transcript 原文逐字仍在** |
-| `pty_readline_test.go` | 3 用例 | 真实 `/dev/ptmx` 伪终端 + raw mode 驱动真实 `readLine`：方向键 / Home / Delete 不污染输入、纯文本、退格编辑 | linux |
-
-平台差异几乎只有终端特性：输入解析、流解析、会话、工具辅助均在纯管道层验证（全平台），仅终端行编辑需 PTY 实测（linux）。*exec 真实进程用例（`sh`）在 windows 上自动跳过，其余全平台。
-
-历史改动详见 [CHANGES.md](CHANGES.md)，最小修复补丁见 [agent-fix.patch](agent-fix.patch)。
-
-## 📦 目录结构
-
-```
-agent-go
-├── agent.go               # 核心逻辑（~1300 行）：推理循环、工具（exec / image_read / memory_edit）、raw mode 输入
-├── openai.go              # OpenAI 兼容厂商层：线格式类型、SSE 传输、字段映射——唯一模型调用面
-├── memory.go              # 会话三分：append-only transcript / 语义记忆 / 游标视图；v3 原子存档
-├── term_linux.go          # 平台适配：raw mode（Linux/macOS/Windows 各一）
-├── term_darwin.go
-├── term_windows.go
-├── exec_unix.go           # 平台适配：进程组（Unix）/ Windows 空实现
-├── exec_windows.go
-├── agent_test.go          # 全平台单测：会话 / 提示词静态守卫 / 输入 / 媒体 / 工具辅助
-├── sse_test.go            # 全平台单测：SSE 全链路（httptest）/ 多轮工具 / memory_edit 端到端
-├── pty_readline_test.go   # PTY 输入回归实测（linux only）
-├── go.mod
-├── debian/                # Debian 打包（dh-golang）：control / rules / changelog / copyright
-├── docs/demo.svg          # 效果演示
-├── CHANGES.md             # 修复说明
-├── .github/workflows/ci.yml       # CI：4 平台测试矩阵（race / shuffle / coverage）+ 6 平台交叉编译 + .deb 打包
-└── .github/workflows/release.yml  # tag v* → 6 平台二进制 + .deb 自动挂 Release
-```
-
-## 🚢 发布到 GitHub
-
-```bash
+# 本地构建
+git clone https://github.com/dksslq/agent-go.git
 cd agent-go
-git init -b main
-git add .
-git commit -m "feat: agent-go — 单二进制终端 AI Agent（designed by DeepSeek × GLM）"
-git remote add origin git@github.com:<your-username>/agent-go.git
-git push -u origin main
+go build -o agent .
+
+# 设置模型与 API 地址；认证通过环境设置注入 AGENT_API_KEY
+export AGENT_MODEL='your-model'
+export AGENT_API_BASE='http://localhost:8080/v1'
+
+# 交互使用
+./agent
+
+# 执行一项任务后退出
+./agent -once -prompt '检查当前项目，运行测试并报告结果'
+
+# stdin 是任务数据；-prompt 是附加指令
+./agent -pipe -prompt '分析日志，给出有证据的结论' < error.log > report.md
+
+# 载入已有会话，或新建；每个工具轮次及用户轮次结束后保存
+./agent -continue session.json -once -prompt '继续检查剩余问题'
 ```
 
-CI 徽章已指向 `dksslq/agent-go`，fork 后把 README 顶部的仓库名改为你自己的即可。
+模型服务需要支持流式 Chat Completions 和工具调用；图片功能还需要模型支持视觉输入。环境变量 `AGENT_MODEL`、`AGENT_API_BASE`、`AGENT_API_KEY` 提供默认值，同名命令行参数覆盖它们。HTTP 代理使用 Go 的标准 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY` 规则；HTTPS 保留证书校验。
 
-## 🧬 Designed by DeepSeek × GLM
+## 自主运行的行为
 
-<div align="center">
+`-once` 要求提供非空 `-prompt`。`-pipe` 读取 stdin 至 EOF，将它与可选的 `-prompt` 用空行连接，原样保留 stdin 的空白与文本，并隐含 `-once`。这两种模式不切换终端状态，也不打印交互提示符。
 
-**本程序由 [DeepSeek](https://www.deepseek.com/) 与 [GLM (Z.ai)](https://z.ai/) 联合设计。**
+stdout 输出流式助手正文，包括工具执行前的说明；工具状态与错误走 stderr。默认日志只展示工具名称，`-verbose` 才展示推理内容、工具参数与结果。这些详细日志可能包含任务数据，请按需要开启。
 
-一个由 AI 为 AI 写的终端 Agent —— 架构与代码出自 **ds × glm** 双模型协作，
-评审、实测修复（编译矩阵 / PTY 复现回归）与本主页亦然。
+| 退出码 | 含义 |
+|---|---|
+| `0` | 成功完成 |
+| `1` | 参数、API、输入、输出或会话保存错误 |
+| `130` | 被 SIGINT / Ctrl+C 中断 |
+| `143` | 收到 SIGTERM 并退出 |
 
-*Less code, more agent.*
+API 错误、断流、未完成的工具参数、模型长度截断均按错误处理。程序不会自动重试请求或重放工具。中断时已经输出的正文可能不完整，消费结果时应同时检查退出码。
 
-</div>
+同一响应中的独立工具并行执行，结果按调用顺序回传；`memory_edit` 在其他工具结束后按调用顺序执行。存在依赖的工作应拆成多个工具轮次。多个 Agent 可以由 shell、CI 或服务管理器作为独立进程调度；每个进程使用独立会话文件，避免互相覆盖。
 
-## 📄 许可
+## 工具与输出
 
-[MIT](LICENSE) © DeepSeek × GLM (Z.ai)
+| 工具 | 行为 |
+|---|---|
+| `exec` | 直接启动程序，将 `input` 写入 stdin，合并 stdout / stderr；无 PTY。支持 `args`、`cwd`、`environ`、超时、后台启动与输出文件 |
+| `image_read` | 读取本地常规图片文件，附加为视觉输入 |
+| `memory_edit` | 用完整 `memory` 文本替换语义记忆，将已完成的历史移出 RAM 和后续 API 上下文 |
+
+`exec` 直接执行程序，需要 shell 语法时显式启动 shell。前台执行要求正数 `timeout_seconds`，支持小数秒；`detach: true` 不等待退出、不捕获输出，并忽略超时。后台进程的后续管理由调用者负责。
+
+输出有两种选择，由模型按任务决定：
+
+- 未设置 `output_file` 时，默认完整内联回传输出。正数 `max_output_chars` 只保留指定数量的 Unicode 字符作为预览；省略或 `0` 表示完整输出。
+- 设置 `output_file` 时，完整原始输出写入一个**新文件**，回传路径、字节数以及可选预览。路径相对于 `cwd`，已有文件会导致工具报错。此时省略或 `0` 的 `max_output_chars` 表示不附带预览。输出文件不能与 `detach` 同用。
+
+预览达到上限后仍继续读取输出、等待命令完成，不会因为预览截断而杀死程序。需要保留完整日志时使用输出文件，再通过 `exec` 检索相关片段：
+
+```json
+{
+  "program": "go",
+  "args": ["test", "./..."],
+  "input": "",
+  "timeout_seconds": 120,
+  "output_file": "test.log",
+  "max_output_chars": 4000
+}
+```
+
+输出文件保留在磁盘上，需要自行归档或删除。字符数与 JSON 字节数均不是 token 数；程序不猜测模型的 tokenizer 或上下文窗口，也不暗中裁掉工具输出。
+
+`unquote_arguments: true` 可递归解释 Go 引号字符串，解释失败保留原文；`quote_result: true` 用 Go 字符串形式转义结果。普通 JSON 参数通常不需要这两个选项。
+
+## 记忆与会话
+
+上下文由系统提示词、模型维护的记忆和未压缩的历史组成。`memory_edit` 必须提交完整记忆；应保留当前目标、用户约束、完成事项、证据、输出文件路径与未完成工作。
+
+默认压缩所有已完成的历史，**包括同一任务中先前完成的步骤**。尚未收齐结果的工具调用组保留，调用与结果不会被游标拆开。可选 `cursor` 使用完整 transcript 的绝对索引，游标只能向前移动。
+
+压缩后的原文进入进程私有的临时 JSONL 存档，释放内存中的历史引用，也不再随每次 API 请求发送。工具结果会报告存档路径，可以用 `exec` 找回原文。临时存档在正常退出或重载会话时清理；需要跨进程保留历史时使用 `-save` 或 `-continue`。
+
+保存的会话仍为完整、可迁移的 v3 JSON：
+
+```json
+{"version":3,"transcript":[{"role":"system","content":"..."}],"memory":"...","cursor":1}
+```
+
+保存时流式合并存档与活跃历史，使用同目录私有临时文件、刷新后替换。加载兼容旧 v3 文件与旧消息数组，并检查工具调用配对；旧数组在下次保存时转为 v3。加载旧会话时保留其中的系统提示词，新的默认规则用于新建会话。
+
+`-save` / `-continue` 在每个工具轮次和用户轮次结束后检查点保存，保存失败会停止当前推理并报告错误。检查点记录会话，不能把外部程序的副作用与保存操作组成事务：异常退出后应先核实已有文件、进程或服务状态，再决定是否重试。
+
+没有固定的工具轮数、图片大小或默认输出大小上限。完整内联输出和未压缩的活跃上下文仍会消耗内存与模型额度；存档与输出文件会占用磁盘。持续任务应使用文件输出并主动整理记忆，CPU、内存、磁盘和进程权限由运行环境配置。
+
+## 参数与交互
+
+| 参数 | 默认 / 用途 |
+|---|---|
+| `-model` | `AGENT_MODEL`；必须指定模型 |
+| `-api-base` | `AGENT_API_BASE`，否则 `http://localhost:8080/v1` |
+| `-api-key` | `AGENT_API_KEY`，否则为空 |
+| `-prompt` / `-once` / `-pipe` | 启动提示词、单次执行、读取 stdin |
+| `-load` / `-save` / `-continue` | 载入已有文件、保存检查点、载入或新建并保存至同一文件 |
+| `-verbose` | 默认关闭；显示推理、工具参数与结果 |
+| `-stream-idle-timeout` | `5m`；等待网络数据的空闲超时，`0` 关闭；`-tool-call-idle-timeout` 为兼容别名 |
+| `-http-idle-timeout` | `5m`；空闲 HTTP 连接保留时间 |
+| `-http-max-idle-conns` | `100`；保留的空闲 HTTP 连接数 |
+| `-reasoning-field` / `-content-field` | delta 字段名，默认 `reasoning_content` / `content` |
+| `-tool-calls-field` / `-finish-reason-field` | 默认 `tool_calls` / `finish_reason` |
+| `-extra` | 可重复的 Base64 JSON 对象；附加厂商参数，不能覆盖 `model`、`messages`、`tools`、`stream` |
+
+`-stream-idle-timeout` 覆盖请求连接、响应头以及后续网络读取等待，不限制一个持续产生数据的任务总时长。Go 标准传输层的连接与 TLS 握手超时仍然适用。
+
+交互命令：`/help`、`/image <path>`、`/image-url <url>`、`/pending`、`/clear`、`/memory`、`/save <file>`、`/reload <file>`，以及 `exit` / `quit`。`/memory` 显示记忆、游标与上下文 JSON 字节数。Ctrl+C 中断当前推理轮，空闲时退出；Ctrl+D 结束输入。SIGTERM 结束整个进程。
+
+Linux / macOS 的前台命令在独立进程组中运行，取消时终止该进程组。Windows 的取消只保证终止直接子进程；需要管理完整进程树时由外部运行环境负责。任何平台的进程控制都不能保证立即结束不可中断的内核操作。
+
+`exec` 继承 Agent 的操作系统权限。生产部署应使用符合任务需要的用户、目录权限和隔离环境。工具输出与记忆作为数据处理，用户授权的文档可用于完成任务；系统提示词不能代替操作系统的权限控制。
+
+## 开发与验证
+
+```bash
+gofmt -l .
+go vet ./...
+go build .
+go test -count=1 -race -shuffle=on -covermode=atomic ./...
+```
+
+CI 在 Linux 的 Go 1.21 与 stable、macOS stable、Windows stable 上运行检查与竞态测试，并交叉编译 Linux / macOS / Windows × amd64 / arm64。测试使用标准库 `testing`、`httptest` 和真实子进程；Linux 还使用 PTY 验证行输入。发布工作流由 `v*` 标签触发，构建平台二进制与 Debian 包。
+
+代码按职责拆分：`cli.go` 处理入口与信号，`agent.go` 处理推理与工具，`openai.go` 处理 API / SSE，`memory.go` 处理会话与存档，`exec_output.go` 处理输出捕获，`output.go` 处理可取消的标准输出，`exec_*.go` / `term_*.go` 提供平台适配。它们构建为同一个可执行文件。
+
+历史变更见 [CHANGES.md](CHANGES.md)。本次审计与行为变更见 [v2.1.0 发布说明](docs/release-v2.1.0.md)。
+
+## 许可与署名
+
+[MIT](LICENSE)。原始设计署名：DeepSeek × GLM (Z.ai)。
