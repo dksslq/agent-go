@@ -21,6 +21,10 @@ import (
 const memoryHeader = "Semantic memory (your own notes, maintained via memory_edit; retain the current objective, user constraints, decisions and unfinished work; absorbed history remains in the session archive):\n\n"
 const sessionVersion = 3
 
+// Windows may deny overlapping replacements of the same destination. Only the
+// commit is serialized; independent sessions still encode and sync concurrently.
+var sessionRenameMu sync.Mutex
+
 type Session struct {
 	Version    int       `json:"version"`
 	Transcript []Message `json:"transcript"` // system anchor + resident tail
@@ -389,7 +393,10 @@ func saveSession(path string, s *Session) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(f.Name(), path); err != nil {
+	sessionRenameMu.Lock()
+	err = os.Rename(f.Name(), path)
+	sessionRenameMu.Unlock()
+	if err != nil {
 		return err
 	}
 	s.Version = sessionVersion
