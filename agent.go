@@ -29,10 +29,6 @@ var (
 	termOld  interface{}
 	outputMu sync.Mutex
 
-	maxFileBytes       int64
-	maxExecOutputChars int
-	maxToolRounds      int
-
 	toolCallIdleTimeout time.Duration
 )
 
@@ -209,23 +205,23 @@ var availableTools = []Tool{
 		Type: "function",
 		Function: ToolDefinition{
 			Name: "memory_edit",
-			Description: "Reorganize your conversation history in place (same session, no restart): older turns are replaced by one user message that contains the summary you author in this call. " +
-				"summary (required): your summary of the history being dropped. " +
-				"keep_last (optional integer, default 0): keep the newest history messages verbatim; the kept window always begins at a user-message boundary so tool_call/tool pairing can never break. " +
-				"The system message and the current tool round are never touched.",
+			Description: "Maintain your semantic memory and compact the visible context (same session, no restart). " +
+				"memory (required): the FULL replacement text of your semantic memory — durable facts, decisions, open threads; delivered back to you as a system message on every later request. " +
+				"cursor (optional integer, default: keep current): transcript index; messages before it leave the visible context but remain preserved in the session file forever. " +
+				"The cursor is one-way (never decreases), never touches the current user turn, and always lands on a safe boundary. The transcript itself is append-only and never rewritten.",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
-					"summary": map[string]interface{}{
+					"memory": map[string]interface{}{
 						"type":        "string",
-						"description": "Your summary of the history being dropped. Compose it before calling.",
+						"description": "Your full semantic memory. Compose it before calling; it replaces the previous snapshot.",
 					},
-					"keep_last": map[string]interface{}{
+					"cursor": map[string]interface{}{
 						"type":        "integer",
-						"description": "Keep this many newest history messages verbatim. Default 0: drop all history before the current round.",
+						"description": "Transcript index to advance to. Messages before it are absorbed into your memory and leave the visible context.",
 					},
 				},
-				"required": []string{"summary"},
+				"required": []string{"memory"},
 			},
 		},
 	},
@@ -345,6 +341,7 @@ func execCmd(ctx context.Context, program string, args []string, input string, t
 	defer cancel()
 
 	cmd := exec.CommandContext(cmdCtx, program, args...)
+	cmd.WaitDelay = 3 * time.Second // SIGKILL backstop: bounds Wait even for unwaitable (D-state) children; not a policy limit
 	cmd.Stdin = strings.NewReader(input)
 	if cwd != "" {
 		cmd.Dir = cwd
@@ -354,9 +351,6 @@ func execCmd(ctx context.Context, program string, args []string, input string, t
 	}
 
 	limit := maxChars
-	if limit <= 0 {
-		limit = maxExecOutputChars
-	}
 	var maxBytes int64
 	if limit > 0 {
 		maxBytes = int64(limit)*4 + 1000
@@ -441,20 +435,9 @@ func readImage(path string) (string, string, error) {
 	if info.IsDir() {
 		return "", "", errors.New("path is a directory")
 	}
-	if maxFileBytes > 0 && info.Size() > maxFileBytes {
-		return "", "", fmt.Errorf("file too large (%d bytes, limit %d)", info.Size(), maxFileBytes)
-	}
-
-	var reader io.Reader = f
-	if maxFileBytes > 0 {
-		reader = io.LimitReader(f, maxFileBytes+1)
-	}
-	data, err := io.ReadAll(reader)
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return "", "", fmt.Errorf("read error: %v", err)
-	}
-	if maxFileBytes > 0 && int64(len(data)) > maxFileBytes {
-		return "", "", fmt.Errorf("file too large (limit %d)", maxFileBytes)
 	}
 
 	mimeType := http.DetectContentType(data)
@@ -476,9 +459,7 @@ func wrapResult(startUnix, endUnix int64, result string) string {
 	return string(j)
 }
 
-var memoryMu sync.Mutex
-
-func runTool(ctx context.Context, msgs *[]Message, name, args string) (string, *Message) {
+func runTool(ctx context.Context, sess *Session, name, args string) (string, *Message) {
 	var params map[string]interface{}
 	if err := json.Unmarshal([]byte(args), &params); err != nil {
 		now := time.Now().Unix()
@@ -557,15 +538,7 @@ func runTool(ctx context.Context, msgs *[]Message, name, args string) (string, *
 		}
 
 	case "memory_edit":
-		summary := parseStringFromParams(params, "summary")
-		keepLast := parseIntFromParams(params, "keep_last")
-		memoryMu.Lock()
-		newMsgs, report := applyMemoryEdit(*msgs, summary, keepLast)
-		if !strings.HasPrefix(report, "Error") {
-			*msgs = newMsgs
-		}
-		memoryMu.Unlock()
-		result = report
+		result = sess.editMemory(parseStringFromParams(params, "memory"), parseIntFromParams(params, "cursor"))
 
 	default:
 		endTime := time.Now().Unix()
@@ -574,56 +547,6 @@ func runTool(ctx context.Context, msgs *[]Message, name, args string) (string, *
 
 	endTime := time.Now().Unix()
 	return wrapResult(startTime, endTime, result), extraMsg
-}
-
-// applyMemoryEdit drops whole user-turn units from the organizable span
-// (everything between the system message and the trailing current-round
-// message) and inserts one user message holding the model-authored summary.
-// A dropped range always starts at a user message and ends at a user-message
-// boundary, so assistant(tool_calls)/tool pairing can never be broken.
-// Returns the new array and a report string for the model.
-func applyMemoryEdit(msgs []Message, summary string, keepLast int) ([]Message, string) {
-	if strings.TrimSpace(summary) == "" {
-		return msgs, "Error: summary is required (write the summary of the history you are dropping)"
-	}
-	hi := len(msgs) - 1
-	if hi < 1 {
-		return msgs, "Error: nothing to organize"
-	}
-	base := msgs[1:hi]
-	if keepLast < 0 {
-		keepLast = 0
-	}
-	if keepLast > len(base) {
-		keepLast = len(base)
-	}
-	var starts []int
-	for i, m := range base {
-		if m.Role == "user" {
-			starts = append(starts, i)
-		}
-	}
-	if len(starts) == 0 {
-		return msgs, "Error: no user message in history; nothing to organize"
-	}
-	s := starts[0]
-	e := len(base)
-	for _, st := range starts {
-		if st >= len(base)-keepLast {
-			e = st
-			break
-		}
-	}
-	if e <= s {
-		return msgs, "Nothing dropped: keep_last already covers the whole history."
-	}
-	out := make([]Message, 0, len(msgs)-(e-s)+1)
-	out = append(out, msgs[0])
-	out = append(out, base[:s]...)
-	out = append(out, Message{Role: "user", Content: summary})
-	out = append(out, base[e:]...)
-	out = append(out, msgs[hi:]...)
-	return out, fmt.Sprintf("Organized: dropped %d messages, kept %d verbatim; memory is now %d messages. The summary message stands in for the dropped history.", e-s, len(base)-(e-s), len(out))
 }
 
 func putStr(s string) {
@@ -658,7 +581,7 @@ func infof(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, format, args...)
 }
 
-func runToolsParallel(ctx context.Context, msgs *[]Message, calls []ToolCall) []Message {
+func runToolsParallel(ctx context.Context, sess *Session, calls []ToolCall) []Message {
 	n := len(calls)
 	if n == 0 {
 		return nil
@@ -688,7 +611,7 @@ func runToolsParallel(ctx context.Context, msgs *[]Message, calls []ToolCall) []
 						extra = nil
 					}
 				}()
-				toolResult, extra = runTool(ctx, msgs, call.Function.Name, call.Function.Arguments)
+				toolResult, extra = runTool(ctx, sess, call.Function.Name, call.Function.Arguments)
 			}()
 
 			printMu.Lock()
@@ -730,9 +653,9 @@ func runToolsParallel(ctx context.Context, msgs *[]Message, calls []ToolCall) []
 	return results
 }
 
-func recordTurnAbort(messages *[]Message, partialContent string, partialToolCalls []ToolCall, marker string) {
+func recordTurnAbort(sess *Session, partialContent string, partialToolCalls []ToolCall, marker string) {
 	if partialContent == "" && len(partialToolCalls) == 0 {
-		*messages = append(*messages, Message{
+		sess.Transcript = append(sess.Transcript, Message{
 			Role:    "assistant",
 			Content: marker,
 		})
@@ -746,13 +669,13 @@ func recordTurnAbort(messages *[]Message, partialContent string, partialToolCall
 		} else {
 			content = content + "\n\n" + marker
 		}
-		*messages = append(*messages, Message{
+		sess.Transcript = append(sess.Transcript, Message{
 			Role:      "assistant",
 			Content:   content,
 			ToolCalls: partialToolCalls,
 		})
 		for _, tc := range partialToolCalls {
-			*messages = append(*messages, Message{
+			sess.Transcript = append(sess.Transcript, Message{
 				Role:       "tool",
 				ToolCallID: tc.ID,
 				Name:       tc.Function.Name,
@@ -762,16 +685,15 @@ func recordTurnAbort(messages *[]Message, partialContent string, partialToolCall
 		return
 	}
 
-	*messages = append(*messages, Message{
+	sess.Transcript = append(sess.Transcript, Message{
 		Role:    "assistant",
 		Content: partialContent + "\n\n" + marker,
 	})
 }
 
-func runInferenceLoop(ctx context.Context, messages *[]Message) error {
-	rounds := 0
+func runInferenceLoop(ctx context.Context, sess *Session) error {
 	for {
-		eventCh, streamCancel, err := chatStream(ctx, *messages)
+		eventCh, streamCancel, err := chatStream(ctx, sess.contextMessages())
 		if err != nil {
 			return err
 		}
@@ -852,13 +774,13 @@ func runInferenceLoop(ctx context.Context, messages *[]Message) error {
 			if errors.Is(loopErr, context.Canceled) {
 				marker = interruptedMarker
 			}
-			recordTurnAbort(messages, fullContent.String(), toolCalls, marker)
+			recordTurnAbort(sess, fullContent.String(), toolCalls, marker)
 			return loopErr
 		}
 
 		if len(toolCalls) == 0 {
 			if fullContent.Len() > 0 {
-				*messages = append(*messages, Message{
+				sess.Transcript = append(sess.Transcript, Message{
 					Role:    "assistant",
 					Content: fullContent.String(),
 				})
@@ -876,20 +798,13 @@ func runInferenceLoop(ctx context.Context, messages *[]Message) error {
 		if fullContent.Len() > 0 {
 			assistantMsg.Content = fullContent.String()
 		}
-		*messages = append(*messages, assistantMsg)
-		toolResults := runToolsParallel(ctx, messages, toolCalls)
-		*messages = append(*messages, toolResults...)
+		sess.Transcript = append(sess.Transcript, assistantMsg)
+		toolResults := runToolsParallel(ctx, sess, toolCalls)
+		sess.Transcript = append(sess.Transcript, toolResults...)
 
 		if ctx.Err() != nil {
-			recordTurnAbort(messages, "", nil, interruptedMarker)
+			recordTurnAbort(sess, "", nil, interruptedMarker)
 			return ctx.Err()
-		}
-		rounds++
-		if maxToolRounds > 0 && rounds >= maxToolRounds {
-			marker := fmt.Sprintf("[Tool round limit reached: %d]", maxToolRounds)
-			infof("\n%s\n", marker)
-			*messages = append(*messages, Message{Role: "assistant", Content: marker})
-			return nil
 		}
 	}
 }
@@ -905,7 +820,7 @@ func systemRules() string {
 		"(7) Use image_read to load local media for visual analysis. " +
 		"(8) Assistant messages may end with an aborted-turn marker (" + strconv.Quote(interruptedMarker) + " or a suffix '[Turn aborted: ...]'); treat as context and do not repeat that output. " +
 		"(9) exec accepts unquote_arguments (recursively strconv.Unquote string arguments before use) and quote_result (strconv.Quote the result before returning); set them yourself as needed. " +
-		"(10) memory_edit replaces older history with a summary you author in the call; do it proactively as history grows; keep_last=N keeps the newest N history messages verbatim (turn-aligned)."
+		"(10) memory_edit rewrites your semantic memory snapshot and advances a one-way cursor: older transcript leaves the visible context but is preserved in the session file; visible context = system + your memory + transcript[cursor:]; compact proactively as the context grows."
 }
 
 func readLine(reader *bufio.Reader) (string, error) {
@@ -966,37 +881,6 @@ func readLine(reader *bufio.Reader) (string, error) {
 	return line.String(), nil
 }
 
-func saveSession(path string, messages []Message) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	enc := json.NewEncoder(f)
-	enc.SetEscapeHTML(false)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(messages); err != nil {
-		f.Close()
-		return err
-	}
-	return f.Close()
-}
-
-func loadSession(path string) ([]Message, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	trimmed := bytes.TrimSpace(data)
-	if len(trimmed) == 0 {
-		return nil, nil
-	}
-	var messages []Message
-	if err := json.Unmarshal(trimmed, &messages); err != nil {
-		return nil, fmt.Errorf("invalid session JSON: %w", err)
-	}
-	return messages, nil
-}
-
 func showSystemPrompt(messages []Message) {
 	if !termRaw {
 		return // autonomous / piped runs: stdout carries model output only
@@ -1021,6 +905,7 @@ func printHelp() {
 	put("  /image-url <url>      Append an image URL for the next message\n")
 	put("  /pending              Show pending media\n")
 	put("  /clear                Clear pending media\n")
+	put("  /memory               Show semantic memory, cursor and context size\n")
 	put("  /save <file>          Save session to file\n")
 	put("  /reload <file>        Reload session from file\n")
 	put("  exit | quit           End session\n")
@@ -1055,6 +940,14 @@ func showPending() {
 		}
 		putf("  [%d] %s\n", i, u)
 	}
+}
+func showMemory(s *Session) {
+	putf("Transcript: %d messages (append-only) | Cursor: %d | Context view: %d messages, %d bytes\n", len(s.Transcript), s.Cursor, len(s.contextMessages()), s.contextBytes())
+	if s.Memory == "" {
+		put("Memory: (empty)\n")
+		return
+	}
+	put("Memory:\n" + s.Memory + "\n")
 }
 
 // pipePrompt merges -pipe stdin data with -prompt: -prompt is the instruction,
@@ -1114,10 +1007,6 @@ func main() {
 	flag.StringVar(&toolCallsField, "tool-calls-field", "tool_calls", "Field name for tool calls in delta")
 	flag.StringVar(&finishReasonField, "finish-reason-field", "finish_reason", "Field name for finish reason in choice")
 
-	flag.Int64Var(&maxFileBytes, "max-file-bytes", 0, "Maximum media file size in bytes (0 = unlimited)")
-	flag.IntVar(&maxExecOutputChars, "max-exec-output-chars", 0, "Default exec output char limit (0 = unlimited)")
-	flag.IntVar(&maxToolRounds, "max-tool-rounds", 25, "Max tool-call rounds per user turn (0 = unlimited)")
-
 	flag.IntVar(&httpMaxIdleConns, "http-max-idle-conns", 1000, "Maximum idle HTTP connections")
 	flag.DurationVar(&httpIdleTimeout, "http-idle-timeout", 5*time.Minute, "HTTP idle connection timeout")
 	flag.DurationVar(&toolCallIdleTimeout, "tool-call-idle-timeout", 5*time.Minute, "Idle timeout for streaming tool call parameters")
@@ -1175,7 +1064,7 @@ func main() {
 		}
 	}
 
-	var messages []Message
+	sess := newSession()
 
 	if loadFile != "" {
 		loaded, err := loadSession(loadFile)
@@ -1183,7 +1072,7 @@ func main() {
 		case err == nil && loaded == nil:
 			infof("Session file %s is empty; starting new session.\n", loadFile)
 		case err == nil:
-			messages = loaded
+			sess = loaded
 			infof("Session loaded.\n")
 		case errors.Is(err, os.ErrNotExist) && !strictLoad:
 			infof("Session file %s not found; starting new session.\n", loadFile)
@@ -1196,13 +1085,11 @@ func main() {
 		}
 	}
 
-	if len(messages) == 0 {
-		messages = []Message{
-			{Role: "system", Content: systemRules()},
-		}
+	if len(sess.Transcript) == 0 {
+		sess = newSession()
 	}
 
-	showSystemPrompt(messages)
+	showSystemPrompt(sess.Transcript)
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -1226,20 +1113,20 @@ func main() {
 	}
 
 	if *promptFlag != "" {
-		before := len(messages)
-		messages = append(messages, Message{Role: "user", Content: sanitize(*promptFlag)})
+		before := len(sess.Transcript)
+		sess.Transcript = append(sess.Transcript, Message{Role: "user", Content: sanitize(*promptFlag)})
 		infCtx, infCancel := context.WithCancel(context.Background())
 		interruptMgr.set(infCancel)
-		err := runInferenceLoop(infCtx, &messages)
+		err := runInferenceLoop(infCtx, sess)
 		infCancel()
 		interruptMgr.clear()
 
-		if err != nil && len(messages) == before+1 {
-			messages = messages[:before]
+		if err != nil && len(sess.Transcript) == before+1 {
+			sess.Transcript = sess.Transcript[:before]
 		}
 
 		if saveFile != "" {
-			if serr := saveSession(saveFile, messages); serr != nil {
+			if serr := saveSession(saveFile, sess); serr != nil {
 				infof("Auto-save failed: %v\n", serr)
 			}
 		}
@@ -1294,6 +1181,10 @@ func main() {
 			put("Pending media cleared.\n")
 			continue
 		}
+		if input == "/memory" {
+			showMemory(sess)
+			continue
+		}
 
 		if input == "/image-url" || strings.HasPrefix(input, "/image-url ") {
 			url := strings.TrimSpace(strings.TrimPrefix(input, "/image-url"))
@@ -1327,7 +1218,7 @@ func main() {
 				put("Usage: /save <filename>\n")
 				continue
 			}
-			if err := saveSession(filename, messages); err != nil {
+			if err := saveSession(filename, sess); err != nil {
 				putf("Save failed: %v\n", err)
 			} else {
 				put("Session saved successfully.\n")
@@ -1345,37 +1236,37 @@ func main() {
 				putf("Reload failed: %v\n", err)
 				continue
 			}
-			if len(loaded) == 0 {
+			if loaded == nil || len(loaded.Transcript) == 0 {
 				put("Reload failed: session file is empty\n")
 				continue
 			}
-			messages = loaded
-			showSystemPrompt(messages)
+			sess = loaded
+			showSystemPrompt(sess.Transcript)
 			put("Session reloaded successfully.\n")
 			continue
 		}
 
-		before := len(messages)
+		before := len(sess.Transcript)
 		userMsg := buildUserMessage(input, &pending)
-		messages = append(messages, userMsg)
+		sess.Transcript = append(sess.Transcript, userMsg)
 
 		infCtx, infCancel := context.WithCancel(context.Background())
 		interruptMgr.set(infCancel)
 
-		err = runInferenceLoop(infCtx, &messages)
+		err = runInferenceLoop(infCtx, sess)
 
 		infCancel()
 		interruptMgr.clear()
 
-		if err != nil && len(messages) == before+1 {
-			messages = messages[:before]
+		if err != nil && len(sess.Transcript) == before+1 {
+			sess.Transcript = sess.Transcript[:before]
 			put("Request failed before any response. Pending media preserved; retry when ready.\n")
 		} else {
 			clearPending()
 		}
 
 		if saveFile != "" {
-			if serr := saveSession(saveFile, messages); serr != nil {
+			if serr := saveSession(saveFile, sess); serr != nil {
 				infof("Auto-save failed: %v\n", serr)
 			}
 		}

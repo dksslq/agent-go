@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -21,7 +20,7 @@ func withStreamDefaults(t *testing.T) {
 	oldAPI, oldKey, oldModel := apiBase, apiKey, modelName
 	oldR, oldC, oldTC, oldFR := reasoningField, contentField, toolCallsField, finishReasonField
 	oldExtra, oldClient := extraRequestFields, httpClient
-	oldIdle, oldRounds := toolCallIdleTimeout, maxToolRounds
+	oldIdle := toolCallIdleTimeout
 
 	apiKey, modelName = "test-key", "test-model"
 	reasoningField, contentField, toolCallsField, finishReasonField =
@@ -34,7 +33,7 @@ func withStreamDefaults(t *testing.T) {
 		apiBase, apiKey, modelName = oldAPI, oldKey, oldModel
 		reasoningField, contentField, toolCallsField, finishReasonField = oldR, oldC, oldTC, oldFR
 		extraRequestFields, httpClient = oldExtra, oldClient
-		toolCallIdleTimeout, maxToolRounds = oldIdle, oldRounds
+		toolCallIdleTimeout = oldIdle
 	})
 }
 
@@ -346,73 +345,59 @@ func TestChatStreamRequestShape(t *testing.T) {
 	}
 }
 
-// ---------- inference loop: tool round limit (end-to-end over httptest) ----------
+// ---------- inference loop: multi-round tool execution (end-to-end over httptest) ----------
 
-// TestExecHelper is the payload executed by the round-limit test's exec tool:
-// when spawned with AGENT_GO_HELPER=1 it exits immediately.
-func TestExecHelper(t *testing.T) {
-	if os.Getenv("AGENT_GO_HELPER") == "1" {
-		os.Exit(0)
-	}
-}
-
-func TestRunInferenceLoopToolRoundLimit(t *testing.T) {
+func TestRunInferenceLoopMultiRound(t *testing.T) {
 	withStreamDefaults(t)
-	maxToolRounds = 3
-
 	toolArgs, _ := json.Marshal(map[string]interface{}{
-		"program":         os.Args[0],
-		"args":            []string{"-test.run=^TestExecHelper$"},
-		"input":           "",
-		"timeout_seconds": 30,
-		"environ":         map[string]string{"AGENT_GO_HELPER": "1"},
+		"program": "echo", "args": []string{"pong"}, "input": "", "timeout_seconds": 5,
 	})
-	turn := deltaChunk(t, map[string]interface{}{
-		toolCallsField: []interface{}{map[string]interface{}{
-			"index": float64(0), "id": "c1", "type": "function",
-			"function": map[string]interface{}{"name": "exec", "arguments": string(toolArgs)},
-		}},
-	}, "tool_calls")
-
-	var mu int64
+	phase := 0
+	var hits int64
 	withSSEServer(t, func(w http.ResponseWriter, r *http.Request) {
-		mu++
-		io.WriteString(w, turn)
+		atomic.AddInt64(&hits, 1)
+		phase++
+		if phase == 1 {
+			io.WriteString(w, toolCallChunk(t, 0, "c1", "exec", string(toolArgs))+
+				deltaChunk(t, map[string]interface{}{}, "tool_calls"))
+			return
+		}
+		io.WriteString(w, deltaChunk(t, map[string]interface{}{contentField: "done"}, "")+sseData("[DONE]"))
 	})
 
-	msgs := []Message{{Role: "system", Content: "s"}, {Role: "user", Content: "go"}}
-	if err := runInferenceLoop(context.Background(), &msgs); err != nil {
-		t.Fatalf("round limit must end the turn gracefully, got %v", err)
+	sess := &Session{
+		Transcript: []Message{{Role: "system", Content: "s"}, {Role: "user", Content: "go"}},
+		Cursor:     1,
 	}
-
-	var assistants, tools int
-	last := msgs[len(msgs)-1]
-	if last.Role != "assistant" || last.Content != "[Tool round limit reached: 3]" {
-		t.Fatalf("missing limit marker, last=%+v", last)
+	if err := runInferenceLoop(context.Background(), sess); err != nil {
+		t.Fatalf("loop: %v", err)
 	}
-	for _, m := range msgs {
-		switch m.Role {
-		case "assistant":
-			if len(m.ToolCalls) > 0 {
-				assistants++
-			}
-		case "tool":
-			tools++
-			var tr ToolResult
-			if json.Unmarshal([]byte(fmt.Sprint(m.Content)), &tr) != nil {
-				t.Fatalf("tool result not wrapped JSON: %v", m.Content)
-			}
-		}
+	if atomic.LoadInt64(&hits) != 2 {
+		t.Fatalf("server hits=%d, want 2", atomic.LoadInt64(&hits))
 	}
-	if assistants != 3 || tools != 3 {
-		t.Fatalf("assistant(tool_calls)=%d tool=%d, want 3/3 (strictly paired)", assistants, tools)
+	roles := make([]string, 0, len(sess.Transcript))
+	for _, m := range sess.Transcript {
+		roles = append(roles, m.Role)
 	}
-	if atomic.LoadInt64(&mu) != 3 {
-		t.Fatalf("server hits=%d, want 3", mu)
+	if strings.Join(roles, ",") != "system,user,assistant,tool,assistant" {
+		t.Fatalf("transcript roles: %v", roles)
+	}
+	if len(sess.Transcript[2].ToolCalls) != 1 || sess.Transcript[3].ToolCallID != "c1" {
+		t.Fatalf("tool pair broken: %+v %+v", sess.Transcript[2], sess.Transcript[3])
+	}
+	var tr ToolResult
+	if err := json.Unmarshal([]byte(fmt.Sprint(sess.Transcript[3].Content)), &tr); err != nil {
+		t.Fatalf("exec result not wrapped: %v", err)
+	}
+	if !strings.Contains(tr.Result, "pong") {
+		t.Fatalf("exec output missing: %q", tr.Result)
+	}
+	if !strings.Contains(fmt.Sprint(sess.Transcript[4].Content), "done") {
+		t.Fatalf("final answer missing: %+v", sess.Transcript[4])
 	}
 }
 
-// ---------- memory_edit end-to-end (in-session memory self-organization) ----------
+// ---------- memory_edit end-to-end (immutable transcript + semantic memory) ----------
 
 func TestMemoryEditEndToEnd(t *testing.T) {
 	withStreamDefaults(t)
@@ -427,20 +412,23 @@ func TestMemoryEditEndToEnd(t *testing.T) {
 		phase++
 		if phase == 1 {
 			io.WriteString(w,
-				toolCallChunk(t, 0, "m1", "memory_edit", `{"summary":"user greeted; agent replied; user asked to organize","keep_last":1}`)+
+				toolCallChunk(t, 0, "m1", "memory_edit", `{"memory":"user greeted; agent said hello; user asked to organize","cursor":3}`)+
 					deltaChunk(t, map[string]interface{}{}, "tool_calls"))
 			return
 		}
 		io.WriteString(w, deltaChunk(t, map[string]interface{}{contentField: "done"}, "")+sseData("[DONE]"))
 	})
 
-	msgs := []Message{
-		{Role: "system", Content: "s"},
-		{Role: "user", Content: "hi"},
-		{Role: "assistant", Content: "hello"},
-		{Role: "user", Content: "organize"},
+	sess := &Session{
+		Transcript: []Message{
+			{Role: "system", Content: "s"},
+			{Role: "user", Content: "hi"},
+			{Role: "assistant", Content: "hello"},
+			{Role: "user", Content: "organize"},
+		},
+		Cursor: 1,
 	}
-	if err := runInferenceLoop(context.Background(), &msgs); err != nil {
+	if err := runInferenceLoop(context.Background(), sess); err != nil {
 		t.Fatal(err)
 	}
 	if len(bodies) != 2 {
@@ -449,13 +437,12 @@ func TestMemoryEditEndToEnd(t *testing.T) {
 
 	r1 := bodies[0]["messages"].([]interface{})
 	if len(r1) != 4 {
-		t.Fatalf("round1 saw %d messages, want 4", len(r1))
+		t.Fatalf("round1 saw %d messages, want 4 (no memory header before the first edit)", len(r1))
 	}
 
-	// round 2 must see the organized memory:
-	// [system, user(summary), user(kept), assistant(tool_calls), tool(result)]
+	// round 2 must see: [system, memory header, user(organize), assistant(tool_calls), tool(result)]
 	r2 := bodies[1]["messages"].([]interface{})
-	want := []string{"system", "user", "user", "assistant", "tool"}
+	want := []string{"system", "system", "user", "assistant", "tool"}
 	if len(r2) != len(want) {
 		t.Fatalf("round2 has %d messages, want %d: %+v", len(r2), len(want), r2)
 	}
@@ -465,15 +452,34 @@ func TestMemoryEditEndToEnd(t *testing.T) {
 			t.Fatalf("round2[%d].role=%q, want %q", i, got, role)
 		}
 	}
-	sum := r2[1].(map[string]interface{})["content"].(string)
-	if !strings.Contains(sum, "asked to organize") {
-		t.Fatalf("summary message wrong: %q", sum)
+	mem := r2[1].(map[string]interface{})["content"].(string)
+	if !strings.Contains(mem, "Semantic memory") || !strings.Contains(mem, "asked to organize") {
+		t.Fatalf("memory header wrong: %q", mem)
+	}
+	if fmt.Sprint(r2[2].(map[string]interface{})["content"]) != "organize" {
+		t.Fatalf("view must resume at the cursor: %+v", r2[2])
 	}
 	var tr ToolResult
 	if err := json.Unmarshal([]byte(fmt.Sprint(r2[4].(map[string]interface{})["content"])), &tr); err != nil {
 		t.Fatalf("memory_edit result not wrapped: %v", err)
 	}
-	if !strings.Contains(tr.Result, "dropped 2") {
+	if !strings.Contains(tr.Result, "Cursor 1 -> 3") {
 		t.Fatalf("unexpected report: %q", tr.Result)
+	}
+
+	// P0: the transcript is append-only — absorbed messages stay on it verbatim.
+	if len(sess.Transcript) != 7 {
+		t.Fatalf("transcript = %d messages, want 7 (4 original + tool pair + final answer)", len(sess.Transcript))
+	}
+	if fmt.Sprint(sess.Transcript[1].Content) != "hi" ||
+		fmt.Sprint(sess.Transcript[2].Content) != "hello" ||
+		fmt.Sprint(sess.Transcript[3].Content) != "organize" {
+		t.Fatalf("transcript must never be rewritten: %+v", sess.Transcript)
+	}
+	if !strings.Contains(fmt.Sprint(sess.Transcript[6].Content), "done") {
+		t.Fatalf("final answer missing from transcript: %+v", sess.Transcript[6])
+	}
+	if sess.Memory != "user greeted; agent said hello; user asked to organize" || sess.Cursor != 3 {
+		t.Fatalf("session state: memory=%q cursor=%d", sess.Memory, sess.Cursor)
 	}
 }

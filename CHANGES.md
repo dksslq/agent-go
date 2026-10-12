@@ -203,3 +203,52 @@ less agent-fix.patch
 **CI**：测试矩阵 4 job——ubuntu(go1.21 下限) / ubuntu(stable) / macos / windows × `-race -shuffle=on -covermode=atomic`；coverage 汇总进 step summary 并挂 artifact。
 
 **测试**：41 函数（+`TestApplyMemoryEdit` 8 子用例真值表；+`TestMemoryEditEndToEnd` 两轮请求体对照——同会话记忆重组、配对完好、wire 级验证）。
+
+---
+
+# v2.0：不可变 transcript + 语义记忆 + 单向游标（审计回应）
+
+## P0-1 memory_edit 不再覆盖原始历史
+
+- v1.9 的 `applyMemoryEdit` 原地改写消息数组并随存档落盘——整理即失真：原始事实、tool_call 上下文、时间顺序全部不可逆丢失。
+- v2.0 会话三分（memory.go）：**Transcript 只追加、永不改写、落盘即原文**；**Memory** 是模型亲写的语义快照；**Cursor** 标记已被吸收进记忆的前缀。`memory_edit(memory, cursor)` 只改快照与游标——原始数据在内存与磁盘上均不可破坏。
+
+## P0-2 前缀缓存：记忆成为稳定头部，视图只在轮间追加
+
+- 请求视图 = `[system] + [memory 头部（第二条 system 消息，位置恒定）] + Transcript[Cursor:]`。两次 memory_edit 之间视图只追加，序列化请求是上一请求的字节前缀扩展（追加只多出结尾 `,` + 新消息）——provider 前缀缓存持续命中。
+- 只有显式 `memory_edit` 换快照时一次性 miss（模型必须看到自己的新记忆，此成本不可避免），棘轮 + 当前轮保护使其天然低频。守卫测试 `TestContextPrefixStable` 钉死该契约。
+
+## P1-1 三个静态天花板全删
+
+- `-max-tool-rounds`（默认 25，唯一默认开启的限制）、`-max-file-bytes`、`-max-exec-output-chars` 整体移除。工具轮次无上限：由"模型停止调用工具 / ctx 取消 / 流错误 / 空闲超时"自然终止。
+- exec 截断保留为模型自选参数（`max_output_chars`）——预算由模型按任务动态决定，运行时不强加默认值。
+- 不做 token 预算器的诚实理由：OpenAI 兼容 API 不上报窗口大小，零依赖约束下无法真计 token。替代是精确字节观测（`/memory` 命令与 `memory_edit` 报告都显示视图字节数），压缩决策交给模型。
+
+## P1-2 exec 生命周期：`cmd.WaitDelay` 兜底
+
+- `runDone` 本为带缓冲 channel（send 永不阻塞），原提议的 select-send 修不存在的阻塞；真实风险是 `cmd.Run()` 本身——子进程对 SIGKILL 无响应（D 状态）时永久挂起。修复：`cmd.WaitDelay = 3s`，ctx 超时 → SIGKILL → 最多再等 3s 强制返回（lifecycle 兜底，非策略限制）。
+- 孙进程持管道导致读端阻塞的场景已有 500ms 读端强制关闭兜底；本轮补真实进程回归测试（`TestExecCmdReal/grandchild holds the pipe`）钉死。
+
+## P1-3 panic 恢复（已存在，平反）
+
+- 并行工具 goroutine 逐个 `defer recover()`，panic 转为 `Panic in tool %s` 错误结果回传模型（`runToolsParallel`）；`main` 顶层 recover 还原终端后退出。`safeGo` 帮助函数是同几行的额外抽象，不引入。
+
+## 会话存档 v3：单文件三分 + 原子落盘
+
+- `{"version":3,"transcript":[…],"memory":"…","cursor":N}`。不用三文件（transcript.jsonl / memory.json / context.cache）：跨文件原子性在 crash 时撕裂；context 是派生物，落盘只会引入分歧。单文件一次 `os.Rename` = crash-safe。
+- 兼容：旧扁平数组会话载入为 transcript（memory 空、cursor=1），零丢失；保存改 tmp 文件 + rename，crash 撕不出半个 JSON。
+
+## 命名统一
+
+- 代码与文档：transcript = 完整只追加记录；memory = 语义快照；context = 请求视图；"history/summary" 指称废弃。
+- wire 角色名（user/assistant/tool/system、tool_calls）保持 OpenAI 标准——v1.8 既定原则，改名即破坏所有兼容端点。
+
+## 拒绝项（记录理由）
+
+- **动态工具注入**：工具集变化本身打穿字节前缀缓存（与 P0-2 同机理），治病比病重；3 个 schema ≈ 常数开销，随历史增长占比趋零。工具数上到十几个再议。
+- **budget.go / context.go 独立文件**：视图组装 + 会话是一个内聚单元（memory.go ~170 行），为单函数开文件是画蛇添足；lifecycle 修复只有一行 `WaitDelay`。
+
+## 实测闭环
+
+- 全套件 44 函数 `-race -shuffle=on` 绿（CI 同口径）。
+- 二进制冒烟：`-pipe` stdout 恰为模型答案、exit 0；存档 v3 字段齐备；`-load` 续档请求体完整携带前轮 transcript；真二进制 memory_edit 端到端——cursor=2 被当前轮保护正确钳到 1，第二轮请求体恰为 `[system, memory, transcript[1:]]`，transcript 逐字未动。

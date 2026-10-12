@@ -2,14 +2,14 @@
 
 # ⚡ agent-go
 
-**一个单二进制、零依赖的终端 AI Agent —— ~1700 行纯 Go（标准库，核心两个文件）**
+**一个单二进制、零依赖的终端 AI Agent —— ~1700 行纯 Go（标准库，核心三个文件）**
 
 流式输出 · 工具调用 · 多模态 · 记忆自整理 · 会话持久化 · 跨平台
 
 [![Go](https://img.shields.io/badge/Go-1.21%2B-00ADD8?logo=go&logoColor=white)](#-快速开始)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#-快速开始)
 [![Deps](https://img.shields.io/badge/third--party%20deps-zero-3fb950)](#-特性)
-[![Tests](https://img.shields.io/badge/tests-41%20pass%20%C2%B7%200%20test%20deps-3fb950)](#-测试与质量)
+[![Tests](https://img.shields.io/badge/tests-44%20pass%20%C2%B7%200%20test%20deps-3fb950)](#-测试与质量)
 [![License](https://img.shields.io/badge/license-MIT-green)](#-许可)
 [![Designed by](https://img.shields.io/badge/designed%20by-DeepSeek%20%C3%97%20GLM-ff7b72)](#-designed-by-deepseek--glm)
 [![CI](https://github.com/dksslq/agent-go/actions/workflows/ci.yml/badge.svg)](https://github.com/dksslq/agent-go/actions/workflows/ci.yml)
@@ -24,15 +24,15 @@
 
 | | |
 |---|---|
-| 🪶 **轻到极致** | 核心就两个文件：`agent.go` + `openai.go`（共 ~1700 行），**只用 Go 标准库、零第三方依赖、无 cgo**，交叉编译产出单文件二进制 |
+| 🪶 **轻到极致** | 核心就三个文件：`agent.go` + `openai.go` + `memory.go`（共 ~1700 行），**只用 Go 标准库、零第三方依赖、无 cgo**，交叉编译产出单文件二进制 |
 | 🌊 **真流式** | SSE 逐 token 输出；`-reasoning-field` 等 4 个 delta 字段名可映射，**原生兼容 DeepSeek-R1 等推理模型**，思考流与正文分流呈现 |
 | 🔧 **工具调用** | `exec`（stdin 注入 / 超时 / 后台 detach / cwd / 环境注入 / 输出限长）、`image_read`、`memory_edit`；**同轮多工具并行执行** |
 | 🖼 **多模态** | `/image` `/image-url` 附件随下一条消息发送——让模型看得见图 |
-| 🧠 **记忆自整理** | 模型用 `memory_edit` 在**同一会话内**重写自己的历史：摘要由模型亲写，`keep_last` 保真近期原文；按整轮单元裁剪，`tool_calls`/`tool` 配对由结构保证永不破坏 |
-| 💾 **会话持久化** | `-save` / `-load` / `-continue` 一键续聊，`/save` `/reload` 在线切换；每轮结束自动存档，对话历史永不丢 |
+| 🧠 **记忆自整理** | transcript 只追加、永不改写：模型用 `memory_edit` 维护自己的语义记忆快照 + 单向游标——旧轮离开可见上下文但**原文永久留档**，`tool_calls`/`tool` 配对与时间顺序在结构上不可能破坏 |
+| 💾 **会话持久化** | `-save` / `-load` / `-continue` 一键续聊，`/save` `/reload` 在线切换；v3 格式（transcript + memory + cursor）单文件原子落盘（tmp + rename），crash 撕不出半个 JSON |
 | ⌨️ **终端原生** | raw mode 行内编辑（退格即见即所得）；**Ctrl+C 中断当前推理轮、再按退出**；转义序列安全吞除——方向键 / Home / Delete 不会污染输入（有 PTY 实测背书） |
 | 🤖 **全自主可编排** | 人机模式与全自主模式同一二进制：`-once` 内联一句话，`-pipe` 让 stdin 成为数据流——stdin 进、stdout 出、处理完即退、退出码可编排；**并发就是 N 个 OS 进程**，xargs / cron / systemd 任意编排 |
-| 🛡 **防御性默认** | `-max-tool-rounds` 工具轮次护栏（默认 25，对齐 OpenAI Agents SDK / LangChain 惯例）、工具流空闲超时、媒体体积上限、panic 恢复并自动还原终端状态 |
+| 🛡 **防御性默认** | 无轮次上限（模型自主决定何时收手，空闲超时兜底）、SIGKILL 后 `WaitDelay` 强制回收防挂死、panic 恢复并自动还原终端状态；限制交给 OS 与外部机制，不内置硬天花板 |
 | 🔌 **即插即用** | 直连任何 **OpenAI 兼容 API**（GLM / DeepSeek / OpenAI / vLLM / Ollama…）；`-extra` 以 Base64 注入任意 JSON 请求字段，厂商私有参数全兼容 |
 
 ## 🎯 适用环境与安全模型
@@ -91,7 +91,7 @@ ls tasks/*.md | xargs -P 8 -I{} sh -c 'agentlet -model glm-4.7 -api-base https:/
 | 愿景里的说法 | 今天就有的原语 |
 |---|---|
 | 主 agent 自主控制并发 | `exec` 本来就能启动任意程序——包括再启动 N 个 `agentlet -pipe` 子代理 |
-| 主 agent 记忆 | `-continue` 的会话文件就是磁盘上的纯 JSON，主 agent 可用 `exec` 读写自己的记忆；同会话内 `memory_edit` 已把"整理"做成原生工具 |
+| 主 agent 记忆 | `-continue` 的会话文件就是磁盘上的纯 JSON（v3：transcript + memory + cursor），主 agent 可用 `exec` 读写自己的记忆；同会话内 `memory_edit` 已把"整理"做成原生工具，且 transcript 永不覆盖 |
 | 侧 agent 压缩对话 | 会话 JSON 管道给侧 agentlet 摘要，校验后原子替换回主会话 |
 | 重生 | systemd `Restart=on-failure` / cron 重拉，`-continue` 从最近一轮自动存档续跑 |
 | 自治 | 退出码 + 每轮自动存档 + 纯净 stdout（自主模式 stdout 只有模型输出，其余走 stderr） |
@@ -169,6 +169,7 @@ cat error.log | ./agent -model glm-4.7 -api-base https://api.z.ai/api/paas/v4 \
 | 命令 | 作用 |
 |---|---|
 | `/image <path>` / `/image-url <url>` | 追加图片到下一条消息 |
+| `/memory` | 查看语义记忆、游标与上下文体积（字节） |
 | `/pending` · `/clear` | 查看 / 清空待发媒体 |
 | `/save <file>` · `/reload <file>` | 保存 / 重载会话 |
 | `exit` · `quit` · `Ctrl+D` | 结束会话 |
@@ -186,7 +187,7 @@ cat error.log | ./agent -model glm-4.7 -api-base https://api.z.ai/api/paas/v4 \
 |---|---|
 | `exec` | 启动任意程序并向 **stdin 写入字符串**；必填 `timeout_seconds`；支持 `cwd`、`environ`、`max_output_chars` 截断、`detach` 后台运行、`unquote_arguments` / `quote_result` 转义控制 |
 | `image_read` | 读取本地图片 → base64 data URI，模型直接"看图" |
-| `memory_edit` | 模型自主整理记忆数组：被裁历史 → 模型亲写的摘要消息，`keep_last` 保留近期原文；系统消息与当前轮永不触碰，配对不可能破坏 |
+| `memory_edit` | 模型自主维护语义记忆：`memory`（快照全文）+ `cursor`（单向游标，当前轮与 tool 边界受保护）；被吸收的轮次原样留在 transcript 与存档中，永不丢失 |
 
 ## ⚙️ 参数一览
 
@@ -199,9 +200,6 @@ cat error.log | ./agent -model glm-4.7 -api-base https://api.z.ai/api/paas/v4 \
 | `-pipe` | — | 读取 stdin 至 EOF 作为提示词内容；与 `-prompt` 组合（指令 + 空行 + 数据）；隐含 `-once` |
 | `-load` / `-save` / `-continue` | — | 启动载入 / 逐轮自动存档 / 续聊（同一文件自动双向） |
 | `-reasoning-field` `-content-field` `-tool-calls-field` `-finish-reason-field` | `reasoning_content` 等 | 流式 delta 字段名映射，适配不同厂商 |
-| `-max-tool-rounds` | `25` | 每轮用户输入的工具循环上限（`0` 不限；对齐主流 Agent 框架惯例） |
-| `-max-file-bytes` | `0` | 媒体文件大小上限 |
-| `-max-exec-output-chars` | `0` | exec 输出默认截断 |
 | `-tool-call-idle-timeout` | `5m` | 工具参数流空闲超时（防模型断流挂死） |
 | `-extra` | 可重复 | Base64(JSON) 合并进请求体，私有参数全兼容 |
 
@@ -210,11 +208,11 @@ cat error.log | ./agent -model glm-4.7 -api-base https://api.z.ai/api/paas/v4 \
 两条硬约束**可 grep 复核**：
 
 - **网络**：程序自身仅 `openai.go` 的 `chatStream` 访问模型 API（`apiBase + "/chat/completions"`），无任何其他网络请求；
-- **文件**：仅 `readMedia`（工具用）与 `saveSession` / `loadSession`（会话存档）读写文件，无其他 IO。
+- **文件**：仅 `readImage`（工具用，agent.go）与 `saveSession` / `loadSession`（会话存档，memory.go，tmp + rename 原子替换）读写文件，无其他 IO。
 
 ```bash
-rg -n 'http\.' openai.go     # 网络面：只有 openai.go 的 chatStream
-rg -n 'os\.(Open|Create)' agent.go   # 文件面：只有媒体与会话
+rg -n 'http\.' openai.go              # 网络面：只有 openai.go 的 chatStream
+rg -n 'os\.(Open|OpenFile|ReadFile)' agent.go memory.go   # 文件面：只有媒体与会话
 ```
 
 ## 🧪 测试与质量
@@ -223,8 +221,8 @@ rg -n 'os\.(Open|Create)' agent.go   # 文件面：只有媒体与会话
 
 | 套件 | 用例 | 覆盖 | 平台 |
 |---|---|---|---|
-| `agent_test.go` | 24 函数 | 会话存档 round-trip；**系统提示词字节恒定守卫**（ENV / TZ / PID 一律不进）；`-pipe` 语义；**execCmd 真实进程端到端**（合流 / stdin 注入 / 超时击杀 / 截断 / cwd / environ / 非零退出 / detach）；runTool 分发与错误路径；unquote / quote 端到端；参数解析；用户消息组装；**memory_edit 真值表 8 子用例**（必填摘要 / 整轮单元裁剪 / keep_last 对齐 / 孤儿结果不保留 / 前缀保留 / 当前轮与配对断言） |
-| `sse_test.go` | 14 函数 | SSE 全链路（httptest 假端点）：reasoning / content 分流；tool_calls 分片累积 / finish 触发 / EOF 兜底；自定义字段映射；坏行跳过；API 错误；断连；ctx 取消；请求形状；**轮次护栏端到端（严格成对）**；**memory_edit 端到端：两轮请求体对照，验证同会话记忆重组** |
+| `agent_test.go` | 28 函数 | 会话 v3 round-trip / **legacy 扁平数组兼容** / **tmp+rename 原子存档**；**系统提示词字节恒定守卫**；`-pipe` 语义；**execCmd 真实进程端到端**（合流 / stdin 注入 / 超时击杀 / **孙进程持管道不挂死** / 截断 / cwd / environ / 非零退出 / detach）；runTool 分发与错误路径；参数解析；用户消息组装；**memory_edit 真值表**（必填 / 缺省游标 / 前进吸收且 transcript 不动 / 不落 tool 结果 / 单向棘轮 / 当前轮保护）；**前缀缓存契约测试**（追加 = 上一请求字节前缀扩展） |
+| `sse_test.go` | 13 函数 | SSE 全链路（httptest 假端点）：reasoning / content 分流；tool_calls 分片累积 / finish 触发 / EOF 兜底；自定义字段映射；坏行跳过；API 错误；断连；ctx 取消；请求形状；**多轮工具循环端到端**；**memory_edit 端到端：两轮请求体对照——第二轮只见 [system, 记忆头, cursor 之后]，transcript 原文逐字仍在** |
 | `pty_readline_test.go` | 3 用例 | 真实 `/dev/ptmx` 伪终端 + raw mode 驱动真实 `readLine`：方向键 / Home / Delete 不污染输入、纯文本、退格编辑 | linux |
 
 平台差异几乎只有终端特性：输入解析、流解析、会话、工具辅助均在纯管道层验证（全平台），仅终端行编辑需 PTY 实测（linux）。*exec 真实进程用例（`sh`）在 windows 上自动跳过，其余全平台。
@@ -235,15 +233,16 @@ rg -n 'os\.(Open|Create)' agent.go   # 文件面：只有媒体与会话
 
 ```
 agent-go
-├── agent.go               # 核心逻辑（~1400 行）：推理循环、工具（exec / image_read / memory_edit）、会话、raw mode 输入
+├── agent.go               # 核心逻辑（~1300 行）：推理循环、工具（exec / image_read / memory_edit）、raw mode 输入
 ├── openai.go              # OpenAI 兼容厂商层：线格式类型、SSE 传输、字段映射——唯一模型调用面
+├── memory.go              # 会话三分：append-only transcript / 语义记忆 / 游标视图；v3 原子存档
 ├── term_linux.go          # 平台适配：raw mode（Linux/macOS/Windows 各一）
 ├── term_darwin.go
 ├── term_windows.go
 ├── exec_unix.go           # 平台适配：进程组（Unix）/ Windows 空实现
 ├── exec_windows.go
 ├── agent_test.go          # 全平台单测：会话 / 提示词静态守卫 / 输入 / 媒体 / 工具辅助
-├── sse_test.go            # 全平台单测：SSE 全链路（httptest）/ 轮次护栏端到端
+├── sse_test.go            # 全平台单测：SSE 全链路（httptest）/ 多轮工具 / memory_edit 端到端
 ├── pty_readline_test.go   # PTY 输入回归实测（linux only）
 ├── go.mod
 ├── debian/                # Debian 打包（dh-golang）：control / rules / changelog / copyright

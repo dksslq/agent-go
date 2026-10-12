@@ -1,8 +1,10 @@
-agentlet (0.1.0-1) unstable; urgency=medium
+agentlet (2.0.0-1) unstable; urgency=medium
 
-  * Initial Debian packaging of upstream agent-go (github.com/dksslq/agent-go).
-    Nano-sized terminal AI agent: OpenAI-compatible streaming, tool calling
-    (exec / image_read / memory_edit), multimodal input, session persistence,
-    raw-mode line editing; pure Go, zero third-party dependencies.
+  * Upstream v2.0: immutable append-only transcript + model-maintained
+    semantic memory with a one-way cursor (memory_edit); v3 session format
+    with atomic tmp+rename saves; vendor layer split (openai.go); all static
+    ceilings removed (no tool-round / file-size / output-cap flags); SIGKILL
+    backstop via cmd.WaitDelay; exec / image_read / memory_edit tools,
+    multimodal input, raw-mode line editing; pure Go, zero dependencies.
 
  -- dksslq <dksslq@users.noreply.github.com>  Fri, 18 Sep 2026 12:58:53 +0000

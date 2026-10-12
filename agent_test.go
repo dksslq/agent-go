@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -124,14 +125,6 @@ func TestReadImage(t *testing.T) {
 			t.Fatalf("expected open error, got %v", err)
 		}
 	})
-	t.Run("too large", func(t *testing.T) {
-		old := maxFileBytes
-		maxFileBytes = 5
-		defer func() { maxFileBytes = old }()
-		if _, _, err := readImage(png); err == nil || !strings.Contains(err.Error(), "too large") {
-			t.Fatalf("expected size error, got %v", err)
-		}
-	})
 }
 
 // ---------- readLine (pipe mode; raw mode is covered by the PTY suite) ----------
@@ -195,7 +188,7 @@ func TestSystemRules(t *testing.T) {
 
 // ---------- session save / load ----------
 
-func sampleSession() []Message {
+func sampleTranscript() []Message {
 	return []Message{
 		{Role: "system", Content: "custom persona"},
 		{Role: "user", Content: "hi"},
@@ -213,16 +206,16 @@ func sampleSession() []Message {
 
 func TestSessionRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "s.json")
-	msgs := sampleSession()
-	if err := saveSession(path, msgs); err != nil {
+	want := &Session{Transcript: sampleTranscript(), Memory: "durable facts", Cursor: 2}
+	if err := saveSession(path, want); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	got, err := loadSession(path)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if !reflect.DeepEqual(got, msgs) {
-		t.Fatalf("round trip mismatch:\n got %#v\nwant %#v", got, msgs)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("round trip mismatch:\n got %#v\nwant %#v", got, want)
 	}
 }
 
@@ -253,25 +246,9 @@ func TestLoadSessionMissing(t *testing.T) {
 	}
 }
 
-func TestLoadSessionLeavesCustomSystemUntouched(t *testing.T) {
+func TestLoadSessionV3(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "s.json")
-	msgs := []Message{{Role: "system", Content: "you are a pirate\nbe verbose"}}
-	b, _ := json.Marshal(msgs)
-	if err := os.WriteFile(path, b, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	got, err := loadSession(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got[0].Content != msgs[0].Content {
-		t.Fatalf("custom system altered:\n got %q", got[0].Content)
-	}
-}
-
-func TestLoadSessionNonStringSystemSkipped(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "s.json")
-	body := `[{"role":"system","content":null},{"role":"system","content":{"nested":true}}]`
+	body := `{"version":3,"transcript":[{"role":"system","content":"s"},{"role":"user","content":"u1"},{"role":"assistant","content":"a1"}],"memory":"notes","cursor":2}`
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -279,13 +256,70 @@ func TestLoadSessionNonStringSystemSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got[0].Content != nil || got[1].Content == nil {
-		t.Fatalf("non-string system content must pass through untouched: %#v", got)
+	if len(got.Transcript) != 3 || got.Memory != "notes" || got.Cursor != 2 {
+		t.Fatalf("v3 fields lost: %+v", got)
+	}
+}
+
+func TestLoadSessionV3ClampsCursor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.json")
+	if err := os.WriteFile(path, []byte(`{"version":3,"transcript":[{"role":"system","content":"s"}],"cursor":9}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Cursor != 1 {
+		t.Fatalf("cursor must clamp into [1, len], got %d", got.Cursor)
+	}
+}
+
+func TestLoadSessionLegacyArray(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.json")
+	body := `[{"role":"system","content":"you are a pirate"},{"role":"system","content":{"nested":true}}]`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Memory != "" || got.Cursor != 1 || len(got.Transcript) != 2 {
+		t.Fatalf("legacy array must map to transcript, nothing absorbed: %+v", got)
+	}
+	if got.Transcript[0].Content != "you are a pirate" || got.Transcript[1].Content == nil {
+		t.Fatalf("legacy content must pass through untouched: %#v", got.Transcript)
+	}
+	if len(got.contextMessages()) != 2 {
+		t.Fatalf("legacy view must show the full transcript: %+v", got.contextMessages())
+	}
+}
+
+func TestSaveSessionAtomicReplace(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s.json")
+	if err := saveSession(path, &Session{Transcript: sampleTranscript(), Memory: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveSession(path, &Session{Transcript: sampleTranscript(), Memory: "two"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Memory != "two" {
+		t.Fatalf("overwrite failed: %q", got.Memory)
+	}
+	leftovers, _ := filepath.Glob(filepath.Join(dir, "*.tmp"))
+	if len(leftovers) != 0 {
+		t.Fatalf("tmp file left behind: %v", leftovers)
 	}
 }
 
 func TestSaveSessionBadPath(t *testing.T) {
-	if err := saveSession(filepath.Join(t.TempDir(), "no-such-dir", "s.json"), nil); err == nil {
+	if err := saveSession(filepath.Join(t.TempDir(), "no-such-dir", "s.json"), &Session{}); err == nil {
 		t.Fatal("expected save error for bad path")
 	}
 }
@@ -336,6 +370,16 @@ func TestExecCmdReal(t *testing.T) {
 		out := execCmd(ctx, "sh", []string{"-c", "sleep 5"}, "", 300*time.Millisecond, 0, "", nil, false)
 		if !strings.Contains(out, "timed out") {
 			t.Fatalf("timeout not reported: %q", out)
+		}
+	})
+	t.Run("grandchild holds the pipe", func(t *testing.T) {
+		start := time.Now()
+		out := execCmd(ctx, "sh", []string{"-c", "echo hi; sh -c 'sleep 5' &"}, "", 10*time.Second, 0, "", nil, false)
+		if elapsed := time.Since(start); elapsed > 4*time.Second {
+			t.Fatalf("wedged on grandchild-held pipe: %v", elapsed)
+		}
+		if !strings.Contains(out, "hi") {
+			t.Fatalf("output lost: %q", out)
 		}
 	})
 	t.Run("output truncation", func(t *testing.T) {
@@ -496,13 +540,11 @@ func TestBuildUserMessage(t *testing.T) {
 	}
 }
 
-// ---------- memory_edit (in-session history self-organization) ----------
+// ---------- memory_edit (immutable transcript + semantic memory) ----------
 
 func assertPairing(t *testing.T, msgs []Message) {
 	t.Helper()
-	// the trailing message is the current round's assistant(tool_calls) whose
-	// results are appended by the loop later — pairing is asserted for the rest
-	for i := 0; i < len(msgs)-1; i++ {
+	for i := 0; i < len(msgs); i++ {
 		m := msgs[i]
 		if len(m.ToolCalls) > 0 {
 			if i+1+len(m.ToolCalls) > len(msgs) {
@@ -518,86 +560,131 @@ func assertPairing(t *testing.T, msgs []Message) {
 	}
 }
 
-func TestApplyMemoryEdit(t *testing.T) {
-	sys := Message{Role: "system", Content: "s"}
-	cur := Message{Role: "assistant", ToolCalls: []ToolCall{{ID: "m1", Type: "function", Function: FunctionCall{Name: "memory_edit", Arguments: "{}"}}}}
-	toolMsg := func(id string) Message {
-		return Message{Role: "tool", ToolCallID: id, Content: "r"}
+func editTestSession() *Session {
+	return &Session{
+		Transcript: []Message{
+			{Role: "system", Content: "s"},
+			{Role: "user", Content: "u1"},
+			{Role: "assistant", Content: "a1", ToolCalls: []ToolCall{{ID: "a", Type: "function", Function: FunctionCall{Name: "exec"}}}},
+			{Role: "tool", ToolCallID: "a", Content: "r"},
+			{Role: "user", Content: "u2"},
+			{Role: "assistant", Content: "a2"},
+		},
+		Cursor: 1,
 	}
+}
 
-	t.Run("summary required", func(t *testing.T) {
-		in := []Message{sys, {Role: "user", Content: "u1"}, cur}
-		out, report := applyMemoryEdit(in, "  ", 0)
-		if len(out) != len(in) || !strings.HasPrefix(report, "Error") {
-			t.Fatalf("empty summary must be rejected: %+v %q", out, report)
+func TestEditMemory(t *testing.T) {
+	t.Run("memory required, state untouched", func(t *testing.T) {
+		s := editTestSession()
+		want := append([]Message(nil), s.Transcript...)
+		if r := s.editMemory("  ", 0); !strings.HasPrefix(r, "Error") {
+			t.Fatalf("blank memory must be rejected: %q", r)
+		}
+		if s.Memory != "" || s.Cursor != 1 || !reflect.DeepEqual(s.Transcript, want) {
+			t.Fatalf("rejected call must not touch state: %+v", s)
 		}
 	})
-	t.Run("nothing to organize", func(t *testing.T) {
-		in := []Message{sys, cur}
-		if _, report := applyMemoryEdit(in, "sum", 0); !strings.HasPrefix(report, "Error") {
-			t.Fatalf("want error, got %q", report)
+	t.Run("cursor omitted keeps window, memory text updated", func(t *testing.T) {
+		s := editTestSession()
+		r := s.editMemory("facts", 0)
+		if s.Cursor != 1 || s.Memory != "facts" || !strings.Contains(r, "Cursor 1 -> 1") {
+			t.Fatalf("cursor must ratchet to current: %+v %q", s, r)
+		}
+		if len(s.contextMessages()) != len(s.Transcript)+1 { // +1: the memory header
+			t.Fatalf("view must show the full transcript plus the header: %+v", s.contextMessages())
 		}
 	})
-	t.Run("drop all by default", func(t *testing.T) {
-		in := []Message{sys, {Role: "user", Content: "u1"}, {Role: "assistant", Content: "a1"}, {Role: "user", Content: "u2"}, cur}
-		out, report := applyMemoryEdit(in, "summary", 0)
-		assertPairing(t, out)
-		if len(out) != 3 || out[1].Role != "user" || out[1].Content != "summary" {
-			t.Fatalf("want [sys summary cur], got %+v", out)
+	t.Run("advance absorbs into memory, transcript untouched", func(t *testing.T) {
+		s := editTestSession()
+		want := append([]Message(nil), s.Transcript...)
+		r := s.editMemory("u1 and its answer", 4)
+		assertPairing(t, s.Transcript)
+		if !reflect.DeepEqual(s.Transcript, want) {
+			t.Fatalf("transcript must be append-only: %+v", s.Transcript)
 		}
-		if !strings.Contains(report, "dropped 3") {
-			t.Fatalf("report: %q", report)
+		if s.Cursor != 4 {
+			t.Fatalf("cursor: got %d, want 4", s.Cursor)
 		}
-	})
-	t.Run("keep_last is turn-aligned", func(t *testing.T) {
-		in := []Message{sys, {Role: "user", Content: "u1"}, {Role: "assistant", ToolCalls: []ToolCall{{ID: "a", Type: "function", Function: FunctionCall{Name: "exec"}}}}, toolMsg("a"), {Role: "user", Content: "u2"}, {Role: "assistant", Content: "a2"}, cur}
-		out, report := applyMemoryEdit(in, "sum", 3)
-		assertPairing(t, out)
-		// the kept window must start at the user message, not at the orphaned tool result
-		roles := []string{"system", "user", "user", "assistant", "assistant"}
-		for i, want := range roles {
-			if out[i].Role != want {
-				t.Fatalf("out[%d].role=%q want %q (%+v)", i, out[i].Role, want, out)
-			}
-		}
-		if !strings.Contains(report, "dropped 3") {
-			t.Fatalf("report: %q", report)
-		}
-		// keep_last that can only be honored by keeping a lone tool result must drop everything instead
-		out, _ = applyMemoryEdit([]Message{sys, {Role: "user", Content: "u1"}, {Role: "assistant", ToolCalls: []ToolCall{{ID: "a", Type: "function", Function: FunctionCall{Name: "exec"}}}}, toolMsg("a"), cur}, "sum", 1)
-		assertPairing(t, out)
-		if len(out) != 3 {
-			t.Fatalf("lone tool result must not be kept: %+v", out)
+		view := s.contextMessages()
+		mem, _ := view[1].Content.(string)
+		if len(view) != 4 || view[0].Role != "system" || view[1].Role != "system" || !strings.Contains(mem, "u1 and its answer") || view[2].Content != "u2" || view[3].Content != "a2" {
+			t.Fatalf("view wrong: %+v (%q)", view, r)
 		}
 	})
-	t.Run("keep covers all", func(t *testing.T) {
-		in := []Message{sys, {Role: "user", Content: "u1"}, cur}
-		out, report := applyMemoryEdit(in, "sum", 99)
-		if len(out) != len(in) || !strings.Contains(report, "Nothing dropped") {
-			t.Fatalf("oversized keep_last must be a no-op: %+v %q", out, report)
+	t.Run("cursor never lands on a tool result", func(t *testing.T) {
+		s := editTestSession()
+		s.editMemory("facts", 3) // Transcript[3] is a tool result
+		if s.Cursor != 4 || s.Transcript[4].Role != "user" {
+			t.Fatalf("cursor must skip forward to a safe boundary: %d", s.Cursor)
 		}
 	})
-	t.Run("no user boundary", func(t *testing.T) {
-		in := []Message{sys, {Role: "assistant", Content: "a1"}, {Role: "assistant", Content: "a2"}, cur}
-		if out, report := applyMemoryEdit(in, "sum", 0); len(out) != len(in) || !strings.HasPrefix(report, "Error") {
-			t.Fatalf("no user message: %+v %q", out, report)
+	t.Run("one-way ratchet", func(t *testing.T) {
+		s := editTestSession()
+		s.editMemory("facts", 4)
+		s.editMemory("more", 2)
+		if s.Cursor != 4 {
+			t.Fatalf("cursor must never decrease: %d", s.Cursor)
 		}
 	})
-	t.Run("prefix before first user preserved", func(t *testing.T) {
-		pre := Message{Role: "assistant", Content: "aborted marker"}
-		in := []Message{sys, pre, {Role: "user", Content: "u1"}, cur}
-		out, _ := applyMemoryEdit(in, "sum", 0)
-		if len(out) != 4 || out[1].Content != "aborted marker" || out[2].Content != "sum" {
-			t.Fatalf("prefix must survive: %+v", out)
+	t.Run("current turn protected", func(t *testing.T) {
+		s := editTestSession()
+		s.Transcript = append(s.Transcript, Message{Role: "user", Content: "u3"})
+		s.editMemory("facts", 99)
+		if s.Cursor != 6 { // lastUserIndex: u3 sits at 6
+			t.Fatalf("cursor must clamp to the newest user message: %d", s.Cursor)
 		}
 	})
-	t.Run("current round untouched", func(t *testing.T) {
-		in := []Message{sys, {Role: "user", Content: "u1"}, cur}
-		out, _ := applyMemoryEdit(in, "sum", 0)
-		assertPairing(t, out)
-		last := out[len(out)-1]
-		if len(last.ToolCalls) != 1 || last.ToolCalls[0].ID != "m1" {
-			t.Fatalf("current assistant(tool_calls) must survive: %+v", last)
-		}
-	})
+}
+
+func TestContextMessages(t *testing.T) {
+	s := newSession()
+	v := s.contextMessages()
+	if len(v) != 1 || v[0].Role != "system" {
+		t.Fatalf("fresh view must be exactly the system anchor: %+v", v)
+	}
+	s.Transcript = append(s.Transcript, Message{Role: "user", Content: "hi"})
+	s.Transcript = append(s.Transcript, Message{Role: "assistant", Content: "hello"})
+	v = s.contextMessages()
+	if len(v) != 3 {
+		t.Fatalf("no memory header while Memory is empty: %+v", v)
+	}
+	s.editMemory("durable facts", 0)
+	v = s.contextMessages()
+	mem, _ := v[1].Content.(string)
+	if len(v) != 4 || v[1].Role != "system" || !strings.Contains(mem, "durable facts") {
+		t.Fatalf("memory header missing or misplaced: %+v", v)
+	}
+}
+
+// The cache contract: between two memory_edit calls the view only grows by
+// appends, so the serialized request of turn N is a byte prefix of turn N+1.
+func TestContextPrefixStable(t *testing.T) {
+	s := newSession()
+	s.Transcript = append(s.Transcript,
+		Message{Role: "user", Content: "u1"},
+		Message{Role: "assistant", Content: "a1"},
+	)
+	b1, err := json.Marshal(s.contextMessages())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Transcript = append(s.Transcript, Message{Role: "user", Content: "u2"})
+	b2, _ := json.Marshal(s.contextMessages())
+	// b1 = [..messages..] and b2 = [..messages..,new] share every byte up to
+	// the array terminator — the appended view re-sends turn-N verbatim, so a
+	// provider prefix cache loses at most the final bracket tokens.
+	if !bytes.HasPrefix(b2, b1[:len(b1)-1]) || b2[len(b1)-1] != ',' {
+		t.Fatalf("append must extend the request as a byte prefix (provider prefix cache):\n b1=%s\n b2=%s", b1, b2)
+	}
+	s.editMemory("facts", 3)
+	b3, _ := json.Marshal(s.contextMessages())
+	if bytes.HasPrefix(b3, b2) {
+		t.Fatal("an explicit memory edit must change the header slot (documented one-time miss)")
+	}
+	s.Transcript = append(s.Transcript, Message{Role: "assistant", Content: "a2"})
+	b4, _ := json.Marshal(s.contextMessages())
+	if !bytes.HasPrefix(b4, b3[:len(b3)-1]) || b4[len(b3)-1] != ',' {
+		t.Fatal("view must be append-only again after the edit")
+	}
 }
