@@ -11,7 +11,9 @@ trap 'rm -rf "$package_dir"' EXIT
 git archive HEAD --prefix "$package_name/" | tar -x -C "$package_dir"
 sed -i "1s/([^)]*)/($package_version)/" "$package_dir/$package_name/debian/changelog"
 set +e
-(cd "$package_dir/$package_name" && dpkg-buildpackage -us -uc -b) > "$package_dir/build.log" 2>&1
+# dh-golang resolves standard-library build dependencies through dpkg. Use the
+# distribution-owned SDK even when setup-go put a separate SDK first in PATH.
+(cd "$package_dir/$package_name" && env -u GOROOT PATH="/usr/bin:/bin:$PATH" dpkg-buildpackage -us -uc -b) > "$package_dir/build.log" 2>&1
 package_status=$?
 set -e
 cat "$package_dir/build.log"

@@ -15,4 +15,4 @@
 
 旧会话保留自己的系统提示词，新建会话使用精简规则。`memory_edit`、`output_file`、退出码及完整 v3 会话格式延续 v2.1.0 的行为。
 
-验证包括工具 schema / 请求大小、记忆压缩、Windows 实际文件占用与跨检查点竞争的回归测试。最终结果与产物以对应提交的 [GitHub Actions](https://github.com/dksslq/agent-go/actions) 和 [Release](https://github.com/dksslq/agent-go/releases) 为准。
+验证包括工具 schema / 请求大小、记忆压缩、Windows 实际文件占用与跨检查点竞争的回归测试。Debian 构建使用发行版 Go，确保标准库依赖可由 dpkg 追踪；平台二进制使用当前 Go。最终结果与产物以对应提交的 [GitHub Actions](https://github.com/dksslq/agent-go/actions) 和 [Release](https://github.com/dksslq/agent-go/releases) 为准。
