@@ -9,7 +9,7 @@
 ## 安装与运行
 
 ```bash
-go install github.com/dksslq/agent-go@latest
+go install github.com/dksslq/agent-go/v2@latest
 ```
 
 也可以从 [Release](https://github.com/dksslq/agent-go/releases) 下载对应平台的二进制。Debian / Ubuntu 的包名为 `agentlet`，安装后命令为 `agentlet`；Go 安装后的命令为 `agent-go`。
@@ -154,7 +154,7 @@ CI 在 Linux 的 Go 1.21 与 stable、macOS stable、Windows stable 上运行检
 
 代码按职责拆分：`cli.go` 处理入口与信号，`agent.go` 处理推理与工具，`openai.go` 处理 API / SSE，`memory.go` 处理会话与存档，`exec_output.go` 处理输出捕获，`output.go` 处理可取消的标准输出，`exec_*.go` / `term_*.go` / `session_*.go` 提供平台适配。它们构建为同一个可执行文件。
 
-历史变更见 [CHANGES.md](CHANGES.md)。运行时审计见 [v2.1.0](docs/release-v2.1.0.md)，提示词与会话占用修订见 [v2.1.1](docs/release-v2.1.1.md)。
+历史变更见 [CHANGES.md](CHANGES.md)。运行时审计见 [v2.1.0](docs/release-v2.1.0.md)，提示词与会话占用修订见 [v2.1.1](docs/release-v2.1.1.md)，安装修订见 [v2.1.2](docs/release-v2.1.2.md)。
 
 ## 许可与署名
 
