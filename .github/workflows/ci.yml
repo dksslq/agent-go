@@ -69,6 +69,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache-dependency-path: go.mod
+
       - name: build and inspect Debian package
         run: |
           sudo apt-get update -qq
