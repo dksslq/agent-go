@@ -22,7 +22,7 @@ type sessionOwner struct {
 	created bool
 }
 
-var sessionDisposition = syscall.NewLazyDLL("kernel32.dll").NewProc("SetFileInformationByHandle")
+var sessionFileInfo = syscall.NewLazyDLL("kernel32.dll").NewProc("SetFileInformationByHandle")
 
 func reserveSession(path string, create bool) (*sessionOwner, error) {
 	if path == "" {
@@ -61,7 +61,7 @@ func (s *sessionOwner) close() error {
 			// FileDispositionInfo deletes this owned placeholder, not whichever
 			// object an outside renamer may now have placed at the same pathname.
 			var deleteFile byte = 1
-			if ok, _, err := sessionDisposition.Call(s.file.Fd(), 4, uintptr(unsafe.Pointer(&deleteFile)), 1); ok == 0 {
+			if ok, _, err := sessionFileInfo.Call(s.file.Fd(), 4, uintptr(unsafe.Pointer(&deleteFile)), 1); ok == 0 {
 				cleanupErr = &os.PathError{Op: "remove unused session", Path: s.path, Err: err}
 			}
 		}
@@ -72,8 +72,7 @@ func (s *sessionOwner) close() error {
 	return nil
 }
 
-func openSessionFile(path string, mode uint32) (*os.File, error) {
-	// Native CreateFile needs the extended prefix for ordinary long paths too.
+func extendedSessionPath(path string) string {
 	if !strings.HasPrefix(path, `\\?\`) {
 		if strings.HasPrefix(path, `\\`) {
 			path = `\\?\UNC\` + path[2:]
@@ -81,6 +80,12 @@ func openSessionFile(path string, mode uint32) (*os.File, error) {
 			path = `\\?\` + path
 		}
 	}
+	return path
+}
+
+func openSessionFile(path string, mode uint32) (*os.File, error) {
+	// Native CreateFile needs the extended prefix for ordinary long paths too.
+	path = extendedSessionPath(path)
 	name, err := syscall.UTF16PtrFromString(path)
 	if err != nil {
 		return nil, err
@@ -116,8 +121,33 @@ func createSessionTemp(path string) (*os.File, error) {
 }
 
 func commitSession(path string, f *os.File, owner *sessionOwner) error {
-	if err := os.Rename(f.Name(), path); err != nil {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
 		return err
+	}
+	name, err := syscall.UTF16FromString(extendedSessionPath(absolute))
+	if err != nil {
+		return err
+	}
+	// FILE_RENAME_INFO has a variable WCHAR tail. Use native alignment and
+	// measured allocation, without MAX_PATH or reopening the exclusive source.
+	type renameInfo struct {
+		Flags          uint32
+		RootDirectory  uintptr
+		FileNameLength uint32
+	}
+	var layout renameInfo
+	offset := unsafe.Offsetof(layout.FileNameLength) + unsafe.Sizeof(layout.FileNameLength)
+	size := int(offset) + 2*len(name)
+	words := make([]uint64, (size+7)/8)
+	info := (*renameInfo)(unsafe.Pointer(&words[0]))
+	info.Flags = 1 | 2 // REPLACE_IF_EXISTS | POSIX_SEMANTICS: retain old open handle
+	info.FileNameLength = uint32(2 * (len(name) - 1))
+	copy(unsafe.Slice((*uint16)(unsafe.Add(unsafe.Pointer(&words[0]), offset)), len(name)), name)
+	// FileRenameInfoEx requires a filesystem supporting POSIX replacement.
+	// Failure keeps both the old snapshot and its read/write ownership intact.
+	if ok, _, err := sessionFileInfo.Call(f.Fd(), 22, uintptr(unsafe.Pointer(&words[0])), uintptr(size)); ok == 0 {
+		return &os.LinkError{Op: "replace session", Old: f.Name(), New: path, Err: err}
 	}
 	old := owner.file
 	owner.file = f // new target was already reserved before replacement
