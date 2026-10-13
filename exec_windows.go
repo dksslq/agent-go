@@ -3,10 +3,24 @@
 
 package main
 
-import "os/exec"
+import (
+	"errors"
+	"os"
+	"os/exec"
+	"syscall"
+)
 
 func setSysProcAttr(cmd *exec.Cmd) {
-	// Windows 不支持 Setpgid，保持空实现即可
+	if cmd.Cancel != nil {
+		cmd.Cancel = func() error {
+			err := cmd.Process.Kill()
+			// Wait releases the handle before the context watcher joins.
+			if errors.Is(err, syscall.EINVAL) {
+				return os.ErrProcessDone
+			}
+			return err
+		}
+	}
 }
 
 // CommandContext already cancels the direct child. Killing it again after
