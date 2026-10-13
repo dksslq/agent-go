@@ -22,3 +22,6 @@ func setSysProcAttr(cmd *exec.Cmd) {
 		}
 	}
 }
+
+// A direct child may exit while descendants still hold its pipes.
+func cleanupCommand(cmd *exec.Cmd) error { return cmd.Cancel() }

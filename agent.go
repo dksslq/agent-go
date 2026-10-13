@@ -248,7 +248,7 @@ func execCmdOutput(ctx context.Context, program string, args []string, input str
 	runErr := cmd.Run()
 	ctxErr := cmdCtx.Err()
 	if cmd.Process != nil && (ctxErr != nil || runErr != nil) {
-		if err := cmd.Cancel(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		if err := cleanupCommand(cmd); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			runErr = errors.Join(runErr, fmt.Errorf("cancel command: %w", err))
 		}
 	}
