@@ -5,6 +5,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"syscall"
 	"unsafe"
 )
@@ -15,31 +16,38 @@ var (
 	procSetConsoleMode = kernel32.NewProc("SetConsoleMode")
 )
 
-const (
-	enableEchoInput = 0x0004
-	enableLineInput = 0x0002
-)
+type consoleState struct {
+	input, output uint32
+	outputHandle  syscall.Handle
+}
 
 func makeRaw(fd int) (interface{}, error) {
-	var oldMode uint32
-	handle := syscall.Handle(fd)
-	r, _, err := procGetConsoleMode.Call(uintptr(handle), uintptr(unsafe.Pointer(&oldMode)))
+	state := consoleState{outputHandle: syscall.Handle(os.Stdout.Fd())}
+	r, _, err := procGetConsoleMode.Call(uintptr(fd), uintptr(unsafe.Pointer(&state.input)))
 	if r == 0 {
 		return nil, fmt.Errorf("getconsolemode: %v", err)
 	}
-	// Keep processed input enabled: Windows must deliver Ctrl+C to the signal
-	// handler instead of returning an ETX byte that line input would discard.
-	newMode := oldMode &^ (enableEchoInput | enableLineInput)
-	r, _, err = procSetConsoleMode.Call(uintptr(handle), uintptr(newMode))
+	r, _, err = procGetConsoleMode.Call(uintptr(state.outputHandle), uintptr(unsafe.Pointer(&state.output)))
 	if r == 0 {
+		return nil, fmt.Errorf("getconsolemode output: %v", err)
+	}
+	r, _, err = procSetConsoleMode.Call(uintptr(state.outputHandle), uintptr(state.output|0x0001|0x0004))
+	if r == 0 {
+		return nil, fmt.Errorf("setconsolemode output: %v", err)
+	}
+	// Keep Ctrl+C signals; enable VT key and bracketed-paste sequences.
+	mode := (state.input &^ (0x0002 | 0x0004)) | 0x0001 | 0x0200
+	r, _, err = procSetConsoleMode.Call(uintptr(fd), uintptr(mode))
+	if r == 0 {
+		procSetConsoleMode.Call(uintptr(state.outputHandle), uintptr(state.output))
 		return nil, fmt.Errorf("setconsolemode: %v", err)
 	}
-	return oldMode, nil
+	return state, nil
 }
 
-func restoreTerm(fd int, state interface{}) {
-	if oldMode, ok := state.(uint32); ok {
-		handle := syscall.Handle(fd)
-		procSetConsoleMode.Call(uintptr(handle), uintptr(oldMode))
+func restoreTerm(fd int, old interface{}) {
+	if state, ok := old.(consoleState); ok {
+		procSetConsoleMode.Call(uintptr(fd), uintptr(state.input))
+		procSetConsoleMode.Call(uintptr(state.outputHandle), uintptr(state.output))
 	}
 }

@@ -33,6 +33,11 @@ func openPTY(t *testing.T) (*os.File, *os.File) {
 		syscall.Close(mfd)
 		t.Fatalf("open slave: %v", err)
 	}
+	if err := syscall.SetNonblock(mfd, true); err != nil {
+		syscall.Close(mfd)
+		syscall.Close(sfd)
+		t.Fatal(err)
+	}
 	return os.NewFile(uintptr(mfd), "/dev/ptmx"), os.NewFile(uintptr(sfd), "/dev/pts")
 }
 

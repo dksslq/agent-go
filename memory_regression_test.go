@@ -132,6 +132,26 @@ func TestMemoryArchiveFailureLeavesStateIntact(t *testing.T) {
 	}
 }
 
+func TestFirstArchiveFailureRemovesTemporaryFile(t *testing.T) {
+	dir := t.TempDir()
+	for _, variable := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(variable, dir)
+	}
+	s := newSession()
+	defer s.close()
+	s.Transcript = append(s.Transcript, Message{Role: "user", Content: func() {}})
+	if result := s.editMemory("retain task", 0); !strings.HasPrefix(result, "Error") {
+		t.Fatalf("invalid history archived: %s", result)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 || s.archive != nil || s.Memory != "" || s.Cursor != 1 || len(s.Transcript) != 2 {
+		t.Fatal("failed first archive left files or changed session state")
+	}
+}
+
 func TestSessionSavePrivateUniqueAndConcurrent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "session.json")

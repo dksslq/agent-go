@@ -142,7 +142,16 @@ func (s *Session) editMemory(memory string, cursor int) string {
 	return fmt.Sprintf("Cursor %d -> %d; next=%d; context_bytes=%d.", old, cursor, s.messageCount(), len(b))
 }
 
-func (s *Session) compactLocked(cursor int) error {
+func (s *Session) compactLocked(cursor int) (resultErr error) {
+	created := false
+	defer func() {
+		if resultErr != nil && created {
+			name := s.archive.Name()
+			s.archive.Close()
+			os.Remove(name)
+			s.archive = nil
+		}
+	}()
 	if cursor <= s.archived+1 {
 		return nil
 	}
@@ -152,6 +161,7 @@ func (s *Session) compactLocked(cursor int) error {
 			return err
 		}
 		s.archive = f
+		created = true
 	}
 	if cursor > s.archiveEntries {
 		stat, err := s.archive.Stat()

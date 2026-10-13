@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -16,7 +14,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 )
 
 var (
@@ -629,79 +626,9 @@ func systemRules() string {
 		"Check interrupted tool effects before retrying. " + strconv.Quote(interruptedMarker) + " and [Turn aborted: ...] mark partial turns. Be concise."
 }
 
-func readLine(reader *bufio.Reader) (string, error) {
-	var line bytes.Buffer
-	for {
-		r, _, err := reader.ReadRune()
-		if err != nil {
-			if err == io.EOF {
-				if line.Len() > 0 {
-					if termRaw {
-						put("\n")
-					}
-				}
-				return line.String(), err
-			}
-			return line.String(), err
-		}
-		if r == '\n' {
-			break
-		}
-		if r == '\r' {
-			if !termRaw && reader.Buffered() > 0 {
-				if next, _ := reader.Peek(1); len(next) == 1 && next[0] == '\n' {
-					reader.ReadByte()
-				}
-			}
-			break
-		}
-		if r == 4 && termRaw {
-			if line.Len() == 0 {
-				return "", io.EOF
-			}
-			break
-		}
-		if r == 127 || r == 8 {
-			if termRaw {
-				if line.Len() > 0 {
-					_, size := utf8.DecodeLastRune(line.Bytes())
-					line.Truncate(line.Len() - size)
-					put("\b \b")
-				}
-			}
-		} else if r == 27 {
-			if next, _, err := reader.ReadRune(); err == nil {
-				if next != '[' && next != 'O' {
-					reader.UnreadRune()
-					continue
-				}
-				for {
-					nr, _, err := reader.ReadRune()
-					if err != nil || (nr >= 0x40 && nr <= 0x7e) {
-						break
-					}
-					if nr == '\r' || nr == '\n' {
-						reader.UnreadRune()
-						break
-					}
-				}
-			}
-		} else if r >= 32 || r == '\t' {
-			line.WriteRune(r)
-			if termRaw {
-				put(string(r))
-			}
-		}
-	}
-	if termRaw {
-		put("\n")
-	}
-	return line.String(), nil
-}
-
 func showSystemPrompt(messages []Message) {
-	if !termRaw {
-		return // autonomous / piped runs: stdout carries model output only
+	if !termRaw || !verbose {
+		return // show internal rules only when explicitly requested
 	}
 	if len(messages) == 0 {
 		return
@@ -721,6 +648,7 @@ func printHelp() {
 	put("  /help                 Show this help\n")
 	put("  /image <path>         Append a local image for the next message\n")
 	put("  /image-url <url>      Append an image URL for the next message\n")
+	put("  /paste                Multiline input; Ctrl+D sends\n")
 	put("  /pending              Show pending media\n")
 	put("  /clear                Clear pending media\n")
 	put("  /memory               Show semantic memory, cursor and context size\n")

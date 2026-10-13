@@ -108,6 +108,19 @@ func TestCLI(t *testing.T) {
 		}
 	})
 	if runtime.GOOS == "linux" {
+		t.Run("interactive help output failure exits", func(t *testing.T) {
+			cmd, _, _ := command(t, "http://localhost:1")
+			full, err := os.OpenFile("/dev/full", os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer full.Close()
+			cmd.Stdout = full
+			cmd.Stdin = strings.NewReader("/help\nquit\n")
+			if code := exit(cmd.Run()); code != 1 {
+				t.Fatalf("status=%d", code)
+			}
+		})
 		t.Run("stdout errors are errors", func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				io.Copy(io.Discard, r.Body)

@@ -15,7 +15,7 @@ func makeRaw(fd int) (interface{}, error) {
 		return nil, fmt.Errorf("tcgetattr: %v", err)
 	}
 	newState := oldState
-	newState.Iflag &^= syscall.IGNBRK | syscall.BRKINT | syscall.PARMRK | syscall.ISTRIP | syscall.INLCR | syscall.IGNCR | syscall.IXON
+	newState.Iflag &^= syscall.IGNBRK | syscall.BRKINT | syscall.PARMRK | syscall.ISTRIP | syscall.INLCR | syscall.IGNCR | syscall.ICRNL | syscall.IXON
 	newState.Oflag &^= syscall.OPOST
 	newState.Lflag &^= syscall.ECHO | syscall.ECHONL | syscall.ICANON | syscall.IEXTEN
 	newState.Cflag &^= syscall.CSIZE | syscall.PARENB

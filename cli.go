@@ -187,7 +187,8 @@ func run(args []string) (status int) {
 		if out != nil && out.Mode()&os.ModeCharDevice != 0 {
 			if old, err := makeRaw(int(os.Stdin.Fd())); err == nil {
 				termRaw, termFd, termOld = true, int(os.Stdin.Fd()), old
-				defer restoreTerm(termFd, termOld)
+				defer stopConsole(termFd, termOld)
+				put(pasteStart)
 			}
 		}
 	}
@@ -202,6 +203,7 @@ func run(args []string) (status int) {
 		cancel()
 		interruptMgr.clear()
 		if err != nil && sess.messageCount() == beforeCount+1 {
+			sess.Transcript[before] = Message{} // release the rejected input's backing-slot reference
 			sess.Transcript = sess.Transcript[:before]
 		} else {
 			clearPending()
@@ -228,22 +230,40 @@ func run(args []string) (status int) {
 		if termRaw {
 			put("\r> ")
 		}
+		if err := outputFailure(); err != nil {
+			infof("Output error: %v\n", err)
+			return 1
+		}
 		input, err := readInput(ctx, func() (string, error) { return readLine(reader) })
 		if err != nil && !errors.Is(err, io.EOF) {
 			infof("Input error: %v\n", err)
 			return failureStatus(err)
 		}
-		input = strings.TrimSpace(input)
-		if input == "" {
+		command := strings.TrimSpace(input)
+		literal := strings.ContainsAny(input, "\r\n")
+		if termRaw && command == "/paste" && !literal {
+			put("Paste text; Ctrl+D sends.\n")
+			input, err = readInput(ctx, func() (string, error) { return readInputLine(reader, true) })
+			if err != nil {
+				infof("Input error: %v\n", err)
+				return failureStatus(err)
+			}
+			command, literal = strings.TrimSpace(input), true
+		}
+		if command == "" {
 			if err == io.EOF {
 				return status
 			}
 			continue
 		}
-		if input == "exit" || input == "quit" {
+		if !literal && (command == "exit" || command == "quit") {
 			return status
 		}
-		handled, commandErr := handleCommand(input, &sess, saveFile)
+		handled := false
+		var commandErr error
+		if !literal {
+			handled, commandErr = handleCommand(command, &sess, saveFile)
+		}
 		if commandErr != nil {
 			infof("Save failed: %v\n", commandErr)
 			return failureStatus(commandErr)

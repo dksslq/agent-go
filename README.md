@@ -135,7 +135,9 @@ Windows 在启动时占用 `-save` / `-continue` 选定的实际会话文件，�
 
 `-stream-idle-timeout` 覆盖请求连接、响应头以及后续网络读取等待，不限制一个持续产生数据的任务总时长。Go 标准传输层的连接与 TLS 握手超时仍然适用。
 
-交互命令：`/help`、`/image <path>`、`/image-url <url>`、`/pending`、`/clear`、`/memory`、`/save <file>`、`/reload <file>`，以及 `exit` / `quit`。`/memory` 显示记忆、游标与上下文 JSON 字节数。Ctrl+C 中断当前推理轮，空闲时退出；Ctrl+D 结束输入。SIGTERM 结束整个进程。
+终端按 Enter 发送。支持 bracketed paste 的终端会保留粘贴中的换行、缩进和特殊字符，粘贴结束后仍需按 Enter；Alt+Enter（以及终端支持时的 Shift+Enter）插入换行。旧终端先输入 `/paste`，再输入或粘贴多行，按 Ctrl+D 发送。多行文本不会被解释为交互命令。键盘 Ctrl+C 仍按中断处理。
+
+交互命令：`/paste`、`/help`、`/image <path>`、`/image-url <url>`、`/pending`、`/clear`、`/memory`、`/save <file>`、`/reload <file>`，以及 `exit` / `quit`。`/memory` 显示记忆、游标与上下文 JSON 字节数。Ctrl+C 中断当前推理轮，空闲时退出；Ctrl+D 结束输入。SIGTERM 结束整个进程。
 
 Linux / macOS 的前台命令在独立进程组中运行，取消时终止该进程组。Windows 的取消只保证终止直接子进程；需要管理完整进程树时由外部运行环境负责。任何平台的进程控制都不能保证立即结束不可中断的内核操作。
 
@@ -154,8 +156,8 @@ CI 在 Linux 的 Go 1.21 与 stable、macOS stable、Windows stable 上运行检
 
 代码按职责拆分：`cli.go` 处理入口与信号，`agent.go` 处理推理与工具，`openai.go` 处理 API / SSE，`memory.go` 处理会话与存档，`exec_output.go` 处理输出捕获，`output.go` 处理可取消的标准输出，`exec_*.go` / `term_*.go` / `session_*.go` 提供平台适配。它们构建为同一个可执行文件。
 
-历史变更见 [CHANGES.md](CHANGES.md)。运行时审计见 [v2.1.0](docs/release-v2.1.0.md)，提示词与会话占用修订见 [v2.1.1](docs/release-v2.1.1.md)，安装修订见 [v2.1.2](docs/release-v2.1.2.md)。
+历史变更见 [CHANGES.md](CHANGES.md)。运行时审计见 [v2.1.0](docs/release-v2.1.0.md)，提示词与会话占用修订见 [v2.1.1](docs/release-v2.1.1.md)，安装修订见 [v2.1.2](docs/release-v2.1.2.md)，终端与资源清理见 [v2.1.3](docs/release-v2.1.3.md)。
 
 ## 许可与署名
 
-[MIT](LICENSE)。原始设计署名：DeepSeek × GLM (Z.ai)。
+[MIT](LICENSE)。开发者：DeepSeek、GLM (Z.ai)、Codex (OpenAI，审计、重构与测试)。

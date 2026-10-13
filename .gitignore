@@ -1,6 +1,8 @@
 # build artifacts
 /agent
 /agent.exe
+/agent-go
+/agent-go.exe
 /dist/
 
 # session archives
