@@ -2,25 +2,42 @@ package main
 
 import (
 	"bytes"
-	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"unicode/utf8"
 )
 
-// commandOutput drains the entire stream while retaining only the requested
-// preview. Passing the same writer for stdout and stderr gives os/exec one
-// shared pipe and one writer goroutine, preserving their combined order.
+// Each pipe has one independent preview. A shared file serializes raw writes;
+// ordering between stdout and stderr is intentionally unspecified.
 type commandOutput struct {
-	file      *os.File
-	path      string
+	file      *commandFile
 	buffer    bytes.Buffer
 	maxChars  int
 	chars     int
 	pending   []byte
 	truncated bool
-	bytes     int64
+	copyErr   error
 }
+
+type commandFile struct {
+	mu    sync.Mutex
+	file  *os.File
+	path  string
+	bytes int64
+}
+
+func (f *commandFile) write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n, err := f.file.Write(p)
+	f.bytes += int64(n)
+	return n, err
+}
+
+// Called after Cmd.Wait joins both pipe readers.
+func (f *commandFile) close() error { return f.file.Close() }
 
 func newCommandOutput(maxChars int, cwd, path string) (*commandOutput, error) {
 	out := &commandOutput{maxChars: maxChars}
@@ -38,17 +55,23 @@ func newCommandOutput(maxChars int, cwd, path string) (*commandOutput, error) {
 	if err != nil {
 		return nil, err
 	}
-	out.file, out.path = f, path
+	out.file = &commandFile{file: f, path: path}
 	return out, nil
+}
+
+// Retain copy errors even when Cmd.Wait prioritizes a nonzero exit status.
+func (out *commandOutput) ReadFrom(reader io.Reader) (int64, error) {
+	n, err := io.Copy(struct{ io.Writer }{out}, reader)
+	out.copyErr = err
+	return n, err
 }
 
 func (out *commandOutput) Write(p []byte) (int, error) {
 	n := len(p)
 	var err error
 	if out.file != nil {
-		n, err = out.file.Write(p)
+		n, err = out.file.write(p)
 	}
-	out.bytes += int64(n)
 	p = p[:n]
 	if out.maxChars <= 0 {
 		if out.file == nil {
@@ -87,7 +110,7 @@ func (out *commandOutput) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (out *commandOutput) finish() (string, error) {
+func (out *commandOutput) finish() string {
 	for len(out.pending) > 0 {
 		_, size := utf8.DecodeRune(out.pending)
 		if out.chars < out.maxChars {
@@ -98,17 +121,5 @@ func (out *commandOutput) finish() (string, error) {
 		}
 		out.pending = out.pending[size:]
 	}
-	result := out.buffer.String()
-	if out.truncated {
-		result += "\n...[truncated]"
-	}
-	if out.file == nil {
-		return result, nil
-	}
-	err := out.file.Close()
-	header := fmt.Sprintf("Output saved to %s (%d bytes)", out.path, out.bytes)
-	if result != "" {
-		header += "\n" + result
-	}
-	return header, err
+	return out.buffer.String()
 }

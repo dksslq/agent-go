@@ -39,10 +39,10 @@ func TestWrapResult(t *testing.T) {
 	if tr.StartUnix != 100 || tr.EndUnix != 200 {
 		t.Fatalf("timestamps lost: %+v", tr)
 	}
-	if !strings.Contains(tr.Result, "\ufffd") || strings.Contains(tr.Result, "\x80") || strings.Contains(tr.Result, "\xff") {
+	if !strings.Contains(tr.Result.(string), "\ufffd") || strings.Contains(tr.Result.(string), "\x80") || strings.Contains(tr.Result.(string), "\xff") {
 		t.Fatalf("invalid UTF-8 not replaced: %q", tr.Result)
 	}
-	if !strings.HasSuffix(tr.Result, "<end>") {
+	if !strings.HasSuffix(tr.Result.(string), "<end>") {
 		t.Fatalf("tail lost: %q", tr.Result)
 	}
 }
@@ -358,7 +358,7 @@ func TestExecCmdReal(t *testing.T) {
 	})
 	t.Run("output truncation", func(t *testing.T) {
 		out := execCmd(ctx, "sh", []string{"-c", "seq 1 30000"}, "", time.Second, 100, "", nil, false)
-		if !strings.Contains(out, "[truncated]") || len(out) > 200 {
+		if !strings.Contains(out, `"stdout_truncated":true`) || len(out) > 400 {
 			t.Fatalf("truncation not applied: %d bytes", len(out))
 		}
 	})
@@ -377,13 +377,13 @@ func TestExecCmdReal(t *testing.T) {
 	})
 	t.Run("nonzero exit reported", func(t *testing.T) {
 		out := execCmd(ctx, "sh", []string{"-c", "echo boom; exit 3"}, "", time.Second, 0, "", nil, false)
-		if !strings.Contains(out, "boom") || !strings.Contains(out, "Error:") {
+		if !strings.Contains(out, "boom") || !strings.Contains(out, `"exit_code":3`) {
 			t.Fatalf("exit error not reported: %q", out)
 		}
 	})
 	t.Run("detach", func(t *testing.T) {
 		out := execCmd(ctx, "sh", []string{"-c", "exit 0"}, "", time.Second, 0, "", nil, true)
-		if !strings.Contains(out, "detached") {
+		if !strings.Contains(out, `"pid":`) {
 			t.Fatalf("detach not reported: %q", out)
 		}
 	})
@@ -426,7 +426,7 @@ func TestRunToolExecFlags(t *testing.T) {
 	if err := json.Unmarshal([]byte(r), &tr); err != nil {
 		t.Fatal(err)
 	}
-	if tr.Result != "hi there\n" {
+	if tr.Result.(map[string]interface{})["stdout"] != "hi there\n" {
 		t.Fatalf("unquote_arguments not applied: %q", tr.Result)
 	}
 
@@ -434,7 +434,15 @@ func TestRunToolExecFlags(t *testing.T) {
 	if err := json.Unmarshal([]byte(r), &tr); err != nil {
 		t.Fatal(err)
 	}
-	if tr.Result != strconv.Quote("quoted\n") {
+	quoted, err := strconv.Unquote(tr.Result.(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload execResult
+	if err := json.Unmarshal([]byte(quoted), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Stdout != "quoted\n" {
 		t.Fatalf("quote_result not applied: %q", tr.Result)
 	}
 }

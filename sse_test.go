@@ -393,7 +393,7 @@ func TestRunInferenceLoopMultiRound(t *testing.T) {
 	if err := json.Unmarshal([]byte(fmt.Sprint(sess.Transcript[3].Content)), &tr); err != nil {
 		t.Fatalf("exec result not wrapped: %v", err)
 	}
-	if !strings.Contains(tr.Result, "pong") {
+	if !strings.Contains(tr.Result.(map[string]interface{})["stdout"].(string), "pong") {
 		t.Fatalf("exec output missing: %q", tr.Result)
 	}
 	if !strings.Contains(fmt.Sprint(sess.Transcript[4].Content), "done") {
@@ -467,7 +467,7 @@ func TestMemoryEditEndToEnd(t *testing.T) {
 	if err := json.Unmarshal([]byte(fmt.Sprint(r2[4].(map[string]interface{})["content"])), &tr); err != nil {
 		t.Fatalf("memory_edit result not wrapped: %v", err)
 	}
-	if !strings.Contains(tr.Result, "Cursor 1 -> 3") {
+	if !strings.Contains(tr.Result.(string), "Cursor 1 -> 3") {
 		t.Fatalf("unexpected report: %q", tr.Result)
 	}
 

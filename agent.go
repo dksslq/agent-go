@@ -62,10 +62,10 @@ type pendingState struct {
 var pending pendingState
 
 type ToolResult struct {
-	StartUnix        int64  `json:"start_unix"`
-	EndUnix          int64  `json:"end_unix"`
-	Result           string `json:"result"`
-	LastRequestBytes int    `json:"last_request_bytes,omitempty"`
+	StartUnix        int64       `json:"start_unix"`
+	EndUnix          int64       `json:"end_unix"`
+	Result           interface{} `json:"result"`
+	LastRequestBytes int         `json:"last_request_bytes,omitempty"`
 }
 
 // StreamEvent is the agent-side calling vocabulary: the inference loop consumes
@@ -98,21 +98,19 @@ func prop(kind, description string) map[string]interface{} {
 
 var availableTools = []Tool{
 	{Type: "function", Function: ToolDefinition{
-		Name: "exec", Description: "Run a program with piped stdin and combined stdout/stderr (no PTY).",
+		Name: "exec", Description: "Run a program (no PTY). Returns stdout, stderr, exit_code; error for runtime failures.",
 		Parameters: map[string]interface{}{
 			"type": "object", "required": []string{"program", "input", "timeout_seconds"},
 			"properties": map[string]interface{}{
-				"program":           prop("string", "Executable name or path."),
-				"args":              map[string]interface{}{"type": "array", "items": prop("string", "")},
-				"input":             prop("string", "Stdin text; empty allowed."),
-				"timeout_seconds":   prop("number", ">0 seconds; ignored when detached."),
-				"max_output_chars":  prop("integer", "Preview characters; never stops the process. 0/omitted: full inline, or no preview with output_file."),
-				"output_file":       prop("string", "New file for full raw output, relative to cwd. Returns path/bytes; read ranges with exec. Incompatible with detach."),
-				"cwd":               prop("string", "Working directory."),
-				"environ":           map[string]interface{}{"type": "object", "additionalProperties": prop("string", ""), "description": "Environment overrides; other variables inherited."},
-				"detach":            prop("boolean", "Start in background; no output or waiting."),
-				"unquote_arguments": prop("boolean", "Recursively unquote Go string literals; invalid literals unchanged."),
-				"quote_result":      prop("boolean", "Return a Go-quoted result string."),
+				"program":          prop("string", "Executable name or path."),
+				"args":             map[string]interface{}{"type": "array", "items": prop("string", "")},
+				"input":            prop("string", "Stdin text; empty allowed."),
+				"timeout_seconds":  prop("number", ">0 seconds; ignored when detached."),
+				"max_output_chars": prop("integer", "Preview characters per stream; process keeps running. 0/omitted: full inline, or no preview with output_file."),
+				"output_file":      prop("string", "New file for full raw stdout+stderr, relative to cwd; cross-stream order unspecified. Returns path/bytes. No detach."),
+				"cwd":              prop("string", "Working directory."),
+				"environ":          map[string]interface{}{"type": "object", "additionalProperties": prop("string", ""), "description": "Environment overrides; other variables inherited."},
+				"detach":           prop("boolean", "Start in background; no output or waiting."),
 			},
 		},
 	}},
@@ -189,79 +187,109 @@ func execCmd(ctx context.Context, program string, args []string, input string, t
 	return execCmdOutput(ctx, program, args, input, timeout, maxChars, cwd, environ, detach, "")
 }
 
+type execResult struct {
+	Stdout          string `json:"stdout"`
+	Stderr          string `json:"stderr"`
+	ExitCode        *int   `json:"exit_code"`
+	Error           string `json:"error,omitempty"`
+	PID             int    `json:"pid,omitempty"`
+	StdoutTruncated bool   `json:"stdout_truncated,omitempty"`
+	StderrTruncated bool   `json:"stderr_truncated,omitempty"`
+	OutputFile      string `json:"output_file,omitempty"`
+	OutputBytes     *int64 `json:"output_bytes,omitempty"`
+}
+
 func execCmdOutput(ctx context.Context, program string, args []string, input string, timeout time.Duration, maxChars int, cwd string, environ map[string]string, detach bool, outputFile string) string {
-	if detach {
-		if outputFile != "" {
-			return "Error: output_file is not supported with detach=true"
-		}
-		if err := ctx.Err(); err != nil {
-			return fmt.Sprintf("Detach start error: %v", err)
-		}
-		cmd := exec.Command(program, args...)
-		cmd.WaitDelay = 500 * time.Millisecond
-		cmd.Stdin = strings.NewReader(input)
-		if cwd != "" {
-			cmd.Dir = cwd
-		}
-		if len(environ) > 0 {
-			cmd.Env = buildCmdEnv(cmd.Environ(), environ)
-		}
-		setSysProcAttr(cmd)
-		if err := cmd.Start(); err != nil {
-			return fmt.Sprintf("Detach start error: %v", err)
-		}
-		pid := cmd.Process.Pid
-		// Release does not reap Unix children or finish os/exec's stdin copy.
-		// Wait in the background so detached execution still releases resources.
-		go cmd.Wait()
-		return fmt.Sprintf("Process %d detached", pid)
+	result := execResult{}
+	finish := func() string { data, _ := json.Marshal(result); return string(data) }
+	if detach && outputFile != "" {
+		result.Error = "output_file is not supported with detach=true"
+		return finish()
 	}
-
-	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
+	cmdCtx := ctx
+	cancel := func() {}
+	if !detach {
+		cmdCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
 	defer cancel()
-
-	cmd := exec.CommandContext(cmdCtx, program, args...)
-	// Once the direct process exits, bound copies from pipes inherited by
-	// grandchildren. WaitDelay cannot bound a process stuck in kernel I/O.
+	var cmd *exec.Cmd
+	if detach {
+		cmd = exec.Command(program, args...)
+	} else {
+		cmd = exec.CommandContext(cmdCtx, program, args...)
+	}
 	cmd.WaitDelay = 500 * time.Millisecond
 	cmd.Stdin = strings.NewReader(input)
-	if cwd != "" {
-		cmd.Dir = cwd
-	}
+	cmd.Dir = cwd
 	if len(environ) > 0 {
 		cmd.Env = buildCmdEnv(cmd.Environ(), environ)
 	}
-
 	setSysProcAttr(cmd)
-	out, err := newCommandOutput(maxChars, cwd, outputFile)
-	if err != nil {
-		return fmt.Sprintf("Output file error: %v", err)
+	if detach {
+		if err := ctx.Err(); err != nil {
+			result.Error = err.Error()
+			return finish()
+		}
+		if err := cmd.Start(); err != nil {
+			result.Error = err.Error()
+			return finish()
+		}
+		result.PID = cmd.Process.Pid
+		go cmd.Wait() // Reap the child and finish os/exec's stdin copy.
+		return finish()
 	}
-	cmd.Stdout, cmd.Stderr = out, out
+	stdout, err := newCommandOutput(maxChars, cwd, outputFile)
+	if err != nil {
+		result.Error = "output file: " + err.Error()
+		return finish()
+	}
+	stderr := &commandOutput{maxChars: maxChars, file: stdout.file}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
 	runErr := cmd.Run()
-	// Cmd.Wait stops watching the context once the direct process exits, even
-	// when descendants still hold its pipes. Clean up our group in that case.
-	if cmd.Process != nil && (cmdCtx.Err() != nil || runErr != nil) {
+	ctxErr := cmdCtx.Err()
+	if cmd.Process != nil && (ctxErr != nil || runErr != nil) {
 		if err := cmd.Cancel(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			runErr = errors.Join(runErr, fmt.Errorf("cancel command: %w", err))
 		}
 	}
-	result, outputErr := out.finish()
-	if runErr != nil {
-		ctxErr := cmdCtx.Err()
-		switch {
-		case errors.Is(ctxErr, context.Canceled) && ctx.Err() != nil:
-			result += fmt.Sprintf("\nError: command interrupted: %v", ctxErr)
-		case errors.Is(ctxErr, context.DeadlineExceeded):
-			result += fmt.Sprintf("\nError: command timed out: %v", ctxErr)
-		default:
-			result += fmt.Sprintf("\nError: %v", runErr)
+	result.Stdout, result.Stderr = stdout.finish(), stderr.finish()
+	result.StdoutTruncated, result.StderrTruncated = stdout.truncated, stderr.truncated
+	if cmd.ProcessState != nil {
+		code := cmd.ProcessState.ExitCode()
+		result.ExitCode = &code
+	}
+	var outputErr error
+	if stdout.copyErr != nil {
+		outputErr = fmt.Errorf("stdout: %w", stdout.copyErr)
+	}
+	if stderr.copyErr != nil {
+		outputErr = errors.Join(outputErr, fmt.Errorf("stderr: %w", stderr.copyErr))
+	}
+	if file := stdout.file; file != nil {
+		outputErr = errors.Join(outputErr, file.close())
+		if cmd.ProcessState == nil {
+			outputErr = errors.Join(outputErr, os.Remove(file.path))
+		} else {
+			size := file.bytes
+			result.OutputFile, result.OutputBytes = file.path, &size
 		}
 	}
-	if outputErr != nil {
-		result += fmt.Sprintf("\nError: closing output file: %v", outputErr)
+	_, exitOnly := runErr.(*exec.ExitError)
+	switch {
+	case runErr != nil && errors.Is(ctxErr, context.DeadlineExceeded):
+		result.Error = "command timed out"
+	case runErr != nil && ctxErr != nil:
+		result.Error = "command interrupted: " + ctxErr.Error()
+	case runErr != nil && (!exitOnly || result.ExitCode != nil && *result.ExitCode < 0):
+		result.Error = runErr.Error()
 	}
-	return result
+	if outputErr != nil {
+		if result.Error != "" {
+			result.Error += "; "
+		}
+		result.Error += "output: " + outputErr.Error()
+	}
+	return finish()
 }
 
 func readImage(path string) (string, string, error) {
@@ -301,29 +329,35 @@ func readImage(path string) (string, string, error) {
 	return fmt.Sprintf("data:%s;base64,%s", mimeType, base64Str), mimeType, nil
 }
 
-func wrapResult(startUnix, endUnix int64, result string) string {
+func wrapResult(startUnix, endUnix int64, result interface{}) string {
 	tr := ToolResult{
 		StartUnix: startUnix,
 		EndUnix:   endUnix,
-		Result:    strings.ToValidUTF8(result, "\ufffd"),
+		Result:    result,
 	}
 	j, _ := json.Marshal(tr)
 	return string(j)
 }
 
 func runTool(ctx context.Context, sess *Session, name, args string) (string, *Message) {
+	startTime := time.Now().Unix()
+	fail := func(text string) (string, *Message) {
+		var value interface{} = text
+		if name == "exec" {
+			value = execResult{Error: text}
+		}
+		return wrapResult(startTime, time.Now().Unix(), value), nil
+	}
+
 	if err := ctx.Err(); err != nil {
-		now := time.Now().Unix()
-		return wrapResult(now, now, "Error: tool canceled: "+err.Error()), nil
+		return fail("tool canceled: " + err.Error())
 	}
 	var params map[string]interface{}
 	if err := json.Unmarshal([]byte(args), &params); err != nil {
-		now := time.Now().Unix()
-		return wrapResult(now, now, fmt.Sprintf("Invalid arguments JSON: %v", err)), nil
+		return fail(fmt.Sprintf("Invalid arguments JSON: %v", err))
 	}
 
-	startTime := time.Now().Unix()
-	var result string
+	var result interface{}
 	var extraMsg *Message
 
 	switch name {
@@ -331,7 +365,7 @@ func runTool(ctx context.Context, sess *Session, name, args string) (string, *Me
 		for _, field := range []string{"unquote_arguments", "quote_result"} {
 			if value, present := params[field]; present {
 				if _, ok := value.(bool); !ok {
-					return wrapResult(startTime, time.Now().Unix(), "Error: "+field+" must be boolean"), nil
+					return fail(field + " must be boolean")
 				}
 			}
 		}
@@ -360,23 +394,25 @@ func runTool(ctx context.Context, sess *Session, name, args string) (string, *Me
 		}
 		encoded, _ := json.Marshal(params)
 		if err := json.Unmarshal(encoded, &checked); err != nil || checked.MaxChars < 0 {
-			return wrapResult(startTime, time.Now().Unix(), "Error: invalid exec parameter types or negative max_output_chars"), nil
+			return fail("invalid exec parameter types or negative max_output_chars")
 		}
 
 		if checked.Program == "" {
-			return wrapResult(startTime, time.Now().Unix(), "Error: program is required"), nil
+			return fail("program is required")
 		}
 		var timeout time.Duration
 		if !checked.Detach {
 			var err error
 			timeout, err = parseTimeout(params)
 			if err != nil {
-				return wrapResult(startTime, time.Now().Unix(), "Error: "+err.Error()), nil
+				return fail(err.Error())
 			}
 		}
-		result = execCmdOutput(ctx, checked.Program, checked.Args, checked.Input, timeout, checked.MaxChars, checked.Cwd, checked.Environ, checked.Detach, checked.OutputFile)
+		execJSON := execCmdOutput(ctx, checked.Program, checked.Args, checked.Input, timeout, checked.MaxChars, checked.Cwd, checked.Environ, checked.Detach, checked.OutputFile)
 		if quoteResult {
-			result = strconv.Quote(result)
+			result = strconv.Quote(execJSON)
+		} else {
+			result = json.RawMessage(execJSON)
 		}
 
 	case "image_read":

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -35,8 +36,8 @@ func TestCommandOutputSplitUTF8AndDiscard(t *testing.T) {
 			t.Fatalf("Write = %d, %v", n, err)
 		}
 	}
-	result, err := out.finish()
-	if err != nil || result != "你好\n...[truncated]" {
+	result := out.finish()
+	if !out.truncated || result != "你好" {
 		t.Fatalf("split UTF-8 preview = %q, %v", result, err)
 	}
 	if out.buffer.Len() != len("你好") || len(out.pending) != 0 {
@@ -50,17 +51,17 @@ func TestCommandOutputIncompleteAndInvalidUTF8(t *testing.T) {
 		limit  int
 		want   string
 	}{
-		{[][]byte{{0xe4}, {'a', 'b'}}, 2, "\xe4a\n...[truncated]"},
-		{[][]byte{{0xe4, 0xbd}}, 1, "\xe4\n...[truncated]"},
+		{[][]byte{{0xe4}, {'a', 'b'}}, 2, "\xe4a"},
+		{[][]byte{{0xe4, 0xbd}}, 1, "\xe4"},
 		{[][]byte{[]byte("你好")}, 2, "你好"},
 	} {
 		out, _ := newCommandOutput(tc.limit, "", "")
 		for _, p := range tc.chunks {
 			out.Write(p)
 		}
-		got, err := out.finish()
-		if err != nil || got != tc.want {
-			t.Fatalf("preview = %q, %v; want %q", got, err, tc.want)
+		got := out.finish()
+		if got != tc.want {
+			t.Fatalf("preview = %q, %v; want %q", got, nil, tc.want)
 		}
 	}
 }
@@ -100,11 +101,11 @@ func TestExecEnvironmentUsesWorkingDirectory(t *testing.T) {
 	}
 	dir := t.TempDir()
 	result := execCmd(context.Background(), os.Args[0], []string{"-test.run=^TestExecEnvironmentHelperProcess$"}, "", 5*time.Second, 0, dir, map[string]string{"AGENT_GO_ENV_HELPER": "1", "AGENT_GO_INJECTED": "yes"}, false)
-	if !strings.Contains(result, "PWD="+dir+"\n") || !strings.Contains(result, "INJECTED=yes\n") {
+	if !strings.Contains(decodeExecResult(t, result).Stdout, "PWD="+dir+"\n") || !strings.Contains(decodeExecResult(t, result).Stdout, "INJECTED=yes\n") {
 		t.Fatalf("injected environment lost working directory: %q", result)
 	}
 	result = execCmd(context.Background(), os.Args[0], []string{"-test.run=^TestExecEnvironmentHelperProcess$"}, "", 5*time.Second, 0, dir, map[string]string{"AGENT_GO_ENV_HELPER": "1", "PWD": "explicit"}, false)
-	if !strings.Contains(result, "PWD=explicit\n") {
+	if !strings.Contains(decodeExecResult(t, result).Stdout, "PWD=explicit\n") {
 		t.Fatalf("explicit PWD override was lost: %q", result)
 	}
 }
@@ -119,7 +120,8 @@ func TestExecOutputLimitDrainsAndPreservesStatus(t *testing.T) {
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("output limit terminated the command: %v; result %q", err, result)
 	}
-	if !strings.HasPrefix(result, strings.Repeat("x", 20)+"\n...[truncated]") || !strings.Contains(result, "Error:") || !strings.Contains(result, "exit status 7") {
+	parsed := decodeExecResult(t, result)
+	if parsed.Stdout != strings.Repeat("x", 20) || !parsed.StdoutTruncated || parsed.ExitCode == nil || *parsed.ExitCode != 7 {
 		t.Fatalf("preview lost output or exit status: %q", result)
 	}
 }
@@ -133,7 +135,8 @@ func TestExecOutputFilePreservesRawBytesAndExistingFiles(t *testing.T) {
 	if err != nil || string(data) != strings.Repeat("x", 100000) {
 		t.Fatalf("raw output not retained: %d bytes, %v", len(data), err)
 	}
-	if !strings.Contains(result, path) || !strings.Contains(result, "100000 bytes") || !strings.Contains(result, strings.Repeat("x", 10)+"\n...[truncated]") || !strings.Contains(result, "exit status 7") {
+	parsed := decodeExecResult(t, result)
+	if parsed.OutputFile != path || parsed.OutputBytes == nil || *parsed.OutputBytes != 100000 || parsed.Stdout != strings.Repeat("x", 10) || !parsed.StdoutTruncated || parsed.ExitCode == nil || *parsed.ExitCode != 7 {
 		t.Fatalf("file result missing preview/status: %q", result)
 	}
 	if runtime.GOOS != "windows" {
@@ -143,7 +146,7 @@ func TestExecOutputFilePreservesRawBytesAndExistingFiles(t *testing.T) {
 		}
 	}
 	result = execCmdOutput(context.Background(), os.Args[0], captureHelperArgs(marker), "", 5*time.Second, 0, dir, nil, false, "output")
-	if !strings.Contains(result, "Output file error:") {
+	if decodeExecResult(t, result).Error == "" {
 		t.Fatalf("existing output file accepted: %q", result)
 	}
 	after, err := os.ReadFile(path)
@@ -159,7 +162,8 @@ func TestCommandOutputFileWithoutPreview(t *testing.T) {
 		t.Fatal(err)
 	}
 	out.Write([]byte("raw\x00bytes\xff"))
-	result, err := out.finish()
+	result := out.finish()
+	err = out.file.close()
 	if err != nil || out.buffer.Len() != 0 || strings.Contains(result, "raw") {
 		t.Fatalf("file-only output retained inline: %q, %v", result, err)
 	}
@@ -236,7 +240,7 @@ func TestExecExitedParentDoesNotLeavePipeHoldingChild(t *testing.T) {
 		t.Run(tc.timeout.String()+tc.exit, func(t *testing.T) {
 			marker := filepath.Join(t.TempDir(), "leaked")
 			result := execCmd(context.Background(), "sh", []string{"-c", `sh -c 'sleep 1; printf leaked > "$1"' sh "$1" &` + tc.exit, "sh", marker}, "", tc.timeout, 0, "", nil, false)
-			if !strings.Contains(result, "Error:") {
+			if decodeExecResult(t, result).Error == "" {
 				t.Fatalf("pipe drain failure was hidden: %q", result)
 			}
 			time.Sleep(1100 * time.Millisecond)
@@ -252,8 +256,8 @@ func TestExecDetachedProcessIsReaped(t *testing.T) {
 		t.Skip("Linux /proc verifies that exited children are reaped")
 	}
 	result := execCmd(context.Background(), "sh", []string{"-c", "exit 0"}, "", time.Second, 0, "", nil, true)
-	var pid int
-	if _, err := fmt.Sscanf(result, "Process %d detached", &pid); err != nil || pid <= 0 {
+	pid := decodeExecResult(t, result).PID
+	if pid <= 0 {
 		t.Fatalf("detach result: %q", result)
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -267,4 +271,13 @@ func TestExecDetachedProcessIsReaped(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func decodeExecResult(t *testing.T, text string) execResult {
+	t.Helper()
+	var result execResult
+	if err := json.Unmarshal([]byte(text), &result); err != nil {
+		t.Fatal(err)
+	}
+	return result
 }

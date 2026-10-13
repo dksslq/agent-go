@@ -62,18 +62,26 @@ API 错误、断流、未完成的工具参数、模型长度截断均按错误�
 
 | 工具 | 行为 |
 |---|---|
-| `exec` | 直接启动程序，将 `input` 写入 stdin，合并 stdout / stderr；无 PTY。支持 `args`、`cwd`、`environ`、超时、后台启动与输出文件 |
+| `exec` | 直接启动程序，将 `input` 写入 stdin，分别返回 stdout、stderr 与退出码；无 PTY。支持工作目录、环境、超时、后台启动与输出文件 |
 | `image_read` | 读取本地常规图片文件，附加为视觉输入 |
 | `memory_edit` | 用完整 `memory` 文本替换语义记忆，将已完成的历史移出 RAM 和后续 API 上下文 |
 
 `exec` 直接执行程序，需要 shell 语法时显式启动 shell。前台执行要求正数 `timeout_seconds`，支持小数秒；`detach: true` 不等待退出、不捕获输出，并忽略超时。后台进程的后续管理由调用者负责。
 
+`exec` 的 `result` 是 JSON 对象，例如：
+
+```json
+{"stdout":"","stderr":"test failed\n","exit_code":1}
+```
+
+`stdout`、`stderr` 始终为字符串。正常退出时 `exit_code` 是程序退出码；信号终止通常为 `-1`，未启动或后台启动时为 `null`。正常非零退出不会重复生成错误说明；超时、取消、信号终止、启动或输出 I/O 失败才附带 `error`，已经捕获的输出仍保留。后台启动成功还返回 `pid`。
+
 输出有两种选择，由模型按任务决定：
 
-- 未设置 `output_file` 时，默认完整内联回传输出。正数 `max_output_chars` 只保留指定数量的 Unicode 字符作为预览；省略或 `0` 表示完整输出。
-- 设置 `output_file` 时，完整原始输出写入一个**新文件**，回传路径、字节数以及可选预览。路径相对于 `cwd`，已有文件会导致工具报错。此时省略或 `0` 的 `max_output_chars` 表示不附带预览。输出文件不能与 `detach` 同用。
+- 未设置 `output_file` 时，默认完整回传两个流。正数 `max_output_chars` 分别限制每个流的 Unicode 字符预览；省略或 `0` 表示完整输出。
+- 设置 `output_file` 时，两个流的完整原始字节写入一个**新文件**，回传 `output_file`、`output_bytes` 以及可选预览。路径相对于 `cwd`，已有文件会导致工具报错。此时省略或 `0` 的 `max_output_chars` 表示不附带预览。输出文件不能与 `detach` 同用；合并文件不保证两个流之间的先后顺序。
 
-预览达到上限后仍继续读取输出、等待命令完成，不会因为预览截断而杀死程序。需要保留完整日志时使用输出文件，再通过 `exec` 检索相关片段：
+发生截断时才附带 `stdout_truncated: true` / `stderr_truncated: true`，程序输出本身不插入提示文字。预览达到上限后仍继续读取两个流、等待命令完成，不会因为预览截断而杀死程序。需要保留完整日志时使用输出文件，再通过 `exec` 检索相关片段：
 
 ```json
 {
@@ -87,8 +95,6 @@ API 错误、断流、未完成的工具参数、模型长度截断均按错误�
 ```
 
 输出文件保留在磁盘上，需要自行归档或删除。字符数与 JSON 字节数均不是 token 数；程序不猜测模型的 tokenizer 或上下文窗口，也不暗中裁掉工具输出。
-
-`unquote_arguments: true` 可递归解释 Go 引号字符串，解释失败保留原文；`quote_result: true` 用 Go 字符串形式转义结果。普通 JSON 参数通常不需要这两个选项。
 
 ## 记忆与会话
 
@@ -156,7 +162,7 @@ CI 在 Linux 的 Go 1.21 与 stable、macOS stable、Windows stable 上运行检
 
 代码按职责拆分：`cli.go` 处理入口与信号，`agent.go` 处理推理与工具，`openai.go` 处理 API / SSE，`memory.go` 处理会话与存档，`exec_output.go` 处理输出捕获，`output.go` 处理可取消的标准输出，`exec_*.go` / `term_*.go` / `session_*.go` 提供平台适配。它们构建为同一个可执行文件。
 
-历史变更见 [CHANGES.md](CHANGES.md)。运行时审计见 [v2.1.0](docs/release-v2.1.0.md)，提示词与会话占用修订见 [v2.1.1](docs/release-v2.1.1.md)，安装修订见 [v2.1.2](docs/release-v2.1.2.md)，终端与资源清理见 [v2.1.3](docs/release-v2.1.3.md)。
+历史变更见 [CHANGES.md](CHANGES.md)。运行时审计见 [v2.1.0](docs/release-v2.1.0.md)，提示词与会话占用修订见 [v2.1.1](docs/release-v2.1.1.md)，安装修订见 [v2.1.2](docs/release-v2.1.2.md)，终端与资源清理见 [v2.1.3](docs/release-v2.1.3.md)，命令结果格式见 [v2.2.0](docs/release-v2.2.0.md)。
 
 ## 许可与署名
 
