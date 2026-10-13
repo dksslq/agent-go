@@ -1,6 +1,7 @@
 agentlet (2.1.2-1) unstable; urgency=medium
 
   * Correct the v2 Go module path and tagged go install instructions.
+  * Keep the API key environment default out of CLI help.
 
  -- dksslq <dksslq@users.noreply.github.com>  Tue, 13 Oct 2026 00:00:00 +0000
 

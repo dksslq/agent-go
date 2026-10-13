@@ -11,6 +11,7 @@ go install github.com/dksslq/agent-go/v2@v2.1.2
 包含 [运行时审计](https://github.com/dksslq/agent-go/blob/v2.1.2/docs/release-v2.1.0.md) 和 [提示词与会话修订](https://github.com/dksslq/agent-go/blob/v2.1.2/docs/release-v2.1.1.md) 的全部修复：
 
 - 严格 SSE 完成校验、错误退出、信号清理、进程回收及每工具轮检查点。
+- 隐藏 `-h` 中的 API key 环境默认值，认证与显式参数覆盖行为保持不变。
 - 大结果可写入完整原始输出文件；`memory_edit` 将已完成历史移到磁盘，释放 RAM 和后续请求中的原文。
 - 工具定义与系统说明减少 42.7% 的 JSON / UTF-8 字节，明确记忆整理时机；反馈实际请求字节数，避免猜测 token 或窗口。
 - Windows 启动时占用所选会话文件的读写权限，基于句柄替换快照；冲突立即失败，无全局进程互斥或自动重试。

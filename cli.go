@@ -39,6 +39,7 @@ func run(args []string) (status int) {
 	fs.BoolVar(&verbose, "verbose", false, "Show reasoning, tool arguments and tool results on stderr")
 	fs.StringVar(&apiBase, "api-base", envDefault("AGENT_API_BASE", "http://localhost:8080/v1"), "API base URL; default from AGENT_API_BASE")
 	fs.StringVar(&apiKey, "api-key", os.Getenv("AGENT_API_KEY"), "API key; default from AGENT_API_KEY")
+	fs.Lookup("api-key").DefValue = "" // keep the effective default out of help
 	fs.StringVar(&modelName, "model", os.Getenv("AGENT_MODEL"), "Model name; default from AGENT_MODEL")
 	fs.StringVar(&reasoningField, "reasoning-field", "reasoning_content", "Reasoning delta field")
 	fs.StringVar(&contentField, "content-field", "content", "Content delta field")

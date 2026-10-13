@@ -175,6 +175,14 @@ func TestCLI(t *testing.T) {
 			t.Fatalf("auth header %q", got)
 		}
 	})
+	t.Run("help hides environment API key", func(t *testing.T) {
+		cmd, out, errout := command(t, "http://127.0.0.1:1", "-h")
+		const key = "help-must-not-display-this"
+		cmd.Env = append(cmd.Env, "AGENT_API_KEY="+key)
+		if code := exit(cmd.Run()); code != 0 || strings.Contains(out.String()+errout.String(), key) || !strings.Contains(errout.String(), "AGENT_API_KEY") {
+			t.Fatalf("status=%d stdout=%q stderr=%q", code, out, errout)
+		}
+	})
 	if runtime.GOOS == "windows" {
 		t.Run("session conflict fails before reading pipe", func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "s.json")
