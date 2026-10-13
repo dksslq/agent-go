@@ -64,6 +64,20 @@ jobs:
           name: coverage
           path: coverage.txt
 
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build and inspect Debian package
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential golang-any debhelper dh-golang
+          bash .github/build-deb.sh
+          dpkg-deb --info dist/agentlet_*.deb
+          dpkg-deb --extract dist/agentlet_*.deb /tmp/agent-go-installed
+          /tmp/agent-go-installed/usr/bin/agentlet -h
+
   cross-build:
     runs-on: ubuntu-latest
     strategy:

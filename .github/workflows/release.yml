@@ -41,14 +41,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential golang-any debhelper dh-golang
-          N=$(dpkg-parsechangelog -S Source)
-          VER="${GITHUB_REF_NAME#v}"
-          git archive HEAD --prefix "${N}-${VER}/" | tar -x -C /tmp
-          sed -i "1s/([^)]*)/(${VER}-1)/" "/tmp/${N}-${VER}/debian/changelog"
-          tar -C /tmp -czf "/tmp/${N}_${VER}.orig.tar.gz" "${N}-${VER}"
-          (cd "/tmp/${N}-${VER}" && dpkg-buildpackage -us -uc -b)
-          DEBVER=$(dpkg-parsechangelog -l "/tmp/${N}-${VER}/debian/changelog" -S Version)
-          cp "/tmp/${N}_${DEBVER}_amd64.deb" dist/
+          bash .github/build-deb.sh "$GITHUB_REF_NAME"
 
       - name: artifact checksums
         working-directory: dist

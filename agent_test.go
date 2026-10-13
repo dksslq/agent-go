@@ -47,22 +47,6 @@ func TestWrapResult(t *testing.T) {
 	}
 }
 
-func TestParseIntFromParams(t *testing.T) {
-	p := map[string]interface{}{"a": float64(7), "f": 3.9, "s": "5"}
-	if got := parseIntFromParams(p, "a"); got != 7 {
-		t.Fatalf("int: got %d", got)
-	}
-	if got := parseIntFromParams(p, "f"); got != 3 {
-		t.Fatalf("float truncation: got %d", got)
-	}
-	if got := parseIntFromParams(p, "s"); got != 0 {
-		t.Fatalf("string must be rejected: got %d", got)
-	}
-	if got := parseIntFromParams(p, "missing"); got != 0 {
-		t.Fatalf("missing must be 0: got %d", got)
-	}
-}
-
 func TestParseBoolFromParams(t *testing.T) {
 	p := map[string]interface{}{"b": true, "s": "true", "n": float64(1)}
 	if !parseBoolFromParams(p, "b") {
@@ -160,7 +144,7 @@ func TestReadLinePipe(t *testing.T) {
 func TestSystemRules(t *testing.T) {
 	s := systemRules()
 	for _, want := range []string{
-		"autonomous assistant", "output_file", "live objective", strconv.Quote(interruptedMarker),
+		"autonomous assistant", "output_file", "milestones", "last_request_bytes", strconv.Quote(interruptedMarker),
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("missing %q in system prompt", want)
@@ -470,14 +454,6 @@ func TestParseExecParams(t *testing.T) {
 	}
 	if _, err := parseTimeout(map[string]interface{}{"timeout_seconds": "3"}); err == nil {
 		t.Fatal("string timeout must error")
-	}
-
-	env := parseEnvFromParams(map[string]interface{}{"environ": map[string]interface{}{"A": "1", "B": float64(2)}})
-	if env["A"] != "1" || len(env) != 1 {
-		t.Fatalf("environ: %v", env)
-	}
-	if parseEnvFromParams(map[string]interface{}{}) != nil {
-		t.Fatal("missing environ must be nil")
 	}
 
 	if got := buildCmdEnv(nil, nil); got != nil {

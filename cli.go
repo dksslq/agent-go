@@ -120,6 +120,52 @@ func run(args []string) (status int) {
 		}
 		return 0
 	}
+	loadFile, saveFile, strictLoad := *load, *save, *load != ""
+	if *resume != "" {
+		if loadFile == "" {
+			loadFile, strictLoad = *resume, false
+		}
+		if saveFile == "" {
+			saveFile = *resume
+		}
+	}
+	// Claim the selected Windows output before reading stdin or starting work.
+	owner, err := reserveSession(saveFile, true)
+	if err != nil {
+		infof("checkpoint failed: %v\n", err)
+		return 1
+	}
+	defer func() {
+		if err := owner.close(); err != nil {
+			infof("Session cleanup failed: %v\n", err)
+			if status == 0 {
+				status = 1
+			}
+		}
+	}()
+	sess := newSession()
+	defer func() { sess.close() }()
+	if loadFile != "" {
+		var loaded *Session
+		var err error
+		if owner.matches(loadFile) && owner.createdNew() {
+			err = os.ErrNotExist
+		} else {
+			loaded, err = loadReservedSession(loadFile, owner)
+		}
+		switch {
+		case err == nil && loaded != nil:
+			sess = loaded
+		case err == nil:
+			infof("Error loading session: existing session file is empty\n")
+			return 1
+		case errors.Is(err, os.ErrNotExist) && !strictLoad:
+		default:
+			infof("Error loading session: %v\n", err)
+			return 1
+		}
+	}
+	sess.saveFile, sess.owner = saveFile, owner
 	if *pipe {
 		p, err := readInput(ctx, func() (string, error) { return pipePrompt(*prompt, os.Stdin) })
 		if err != nil {
@@ -144,32 +190,6 @@ func run(args []string) (status int) {
 			}
 		}
 	}
-	loadFile, saveFile, strictLoad := *load, *save, *load != ""
-	if *resume != "" {
-		if loadFile == "" {
-			loadFile, strictLoad = *resume, false
-		}
-		if saveFile == "" {
-			saveFile = *resume
-		}
-	}
-	sess := newSession()
-	defer func() { sess.close() }()
-	if loadFile != "" {
-		loaded, err := loadSession(loadFile)
-		switch {
-		case err == nil && loaded != nil:
-			sess = loaded
-		case err == nil:
-			infof("Error loading session: existing session file is empty\n")
-			return 1
-		case errors.Is(err, os.ErrNotExist) && !strictLoad:
-		default:
-			infof("Error loading session: %v\n", err)
-			return 1
-		}
-	}
-	sess.saveFile = saveFile
 	showSystemPrompt(sess.Transcript)
 	turn := func(msg Message) error {
 		before := len(sess.Transcript)
@@ -185,9 +205,9 @@ func run(args []string) (status int) {
 		} else {
 			clearPending()
 		}
-		if saveFile != "" {
+		if saveFile != "" && !errors.Is(err, errCheckpoint) {
 			if saveErr := saveSession(saveFile, sess); saveErr != nil {
-				err = errors.Join(err, fmt.Errorf("checkpoint failed: %w", saveErr))
+				err = errors.Join(err, fmt.Errorf("%w: %w", errCheckpoint, saveErr))
 			}
 		}
 		if err != nil {
@@ -198,7 +218,7 @@ func run(args []string) (status int) {
 	if *prompt != "" {
 		err := turn(Message{Role: "user", Content: *prompt})
 		status = failureStatus(err)
-		if *once || ctx.Err() != nil {
+		if *once || ctx.Err() != nil || errors.Is(err, errCheckpoint) {
 			return status
 		}
 	}
@@ -222,10 +242,19 @@ func run(args []string) (status int) {
 		if input == "exit" || input == "quit" {
 			return status
 		}
-		if handleCommand(input, &sess, saveFile) {
+		handled, commandErr := handleCommand(input, &sess, saveFile)
+		if commandErr != nil {
+			infof("Save failed: %v\n", commandErr)
+			return failureStatus(commandErr)
+		}
+		if handled {
 			continue
 		}
-		status = failureStatus(turn(buildUserMessage(input, &pending)))
+		turnErr := turn(buildUserMessage(input, &pending))
+		status = failureStatus(turnErr)
+		if errors.Is(turnErr, errCheckpoint) {
+			return status
+		}
 		if ctx.Err() != nil {
 			return failureStatus(ctx.Err())
 		}
@@ -256,7 +285,7 @@ func readInput(ctx context.Context, read func() (string, error)) (string, error)
 	}
 }
 
-func handleCommand(input string, sess **Session, saveFile string) bool {
+func handleCommand(input string, sess **Session, saveFile string) (bool, error) {
 	cmd, arg, _ := strings.Cut(input, " ")
 	arg = strings.TrimSpace(arg)
 	switch cmd {
@@ -292,17 +321,17 @@ func handleCommand(input string, sess **Session, saveFile string) bool {
 		}
 		if cmd == "/save" {
 			if err := saveSession(arg, *sess); err != nil {
-				putf("Save failed: %v\n", err)
-			} else {
-				put("Session saved.\n")
+				return true, fmt.Errorf("%w: %w", errCheckpoint, err)
 			}
+			put("Session saved.\n")
 			break
 		}
-		loaded, err := loadSession(arg)
+		loaded, err := loadReservedSession(arg, (*sess).owner)
 		if err != nil || loaded == nil {
 			putf("Reload failed: %v (session must be nonempty)\n", err)
 			break
 		}
+		loaded.owner = (*sess).owner
 		(*sess).close()
 		*sess = loaded
 		loaded.saveFile = saveFile
@@ -310,7 +339,7 @@ func handleCommand(input string, sess **Session, saveFile string) bool {
 		showSystemPrompt(loaded.Transcript)
 		put("Session reloaded.\n")
 	default:
-		return false
+		return false, nil
 	}
-	return true
+	return true, nil
 }

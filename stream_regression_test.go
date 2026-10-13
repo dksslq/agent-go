@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -353,5 +354,43 @@ func TestStreamMarshalFailureDoesNotIssueRequest(t *testing.T) {
 	extraRequestFields = []map[string]interface{}{{"bad": make(chan int)}}
 	if _, _, err := chatStream(context.Background(), nil); err == nil || called {
 		t.Fatalf("failed marshal issued a request: called=%t err=%v", called, err)
+	}
+}
+
+func TestStreamRequestSizeMatchesHTTPPayload(t *testing.T) {
+	withStreamDefaults(t)
+	extraRequestFields = []map[string]interface{}{{"temperature": 0.5, "provider_option": "追加\n字段"}}
+	bodyCh := make(chan []byte, 1)
+	withSSEServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		bodyCh <- body
+		io.WriteString(w, deltaChunk(t, map[string]interface{}{contentField: "answer"}, "stop"))
+	})
+	reported, reports := 0, 0
+	ch, cancel, err := chatStream(context.Background(), []Message{{Role: "user", Content: "你好\n世界"}}, func(n int) {
+		reported, reports = n, reports+1
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	if reports != 1 || reported == 0 {
+		t.Fatalf("request size was not reported once before chatStream returned: bytes=%d reports=%d", reported, reports)
+	}
+	var events []StreamEvent
+	for event := range ch {
+		events = append(events, event)
+	}
+	assertEvents(t, events, []StreamEvent{{Type: EventToken, Text: "answer"}})
+	body := <-bodyCh
+	if reported != len(body) {
+		t.Fatalf("reported %d request bytes, HTTP server read %d", reported, len(body))
+	}
+	var request map[string]interface{}
+	if err := json.Unmarshal(body, &request); err != nil || request["temperature"] != 0.5 || request["provider_option"] != "追加\n字段" {
+		t.Fatalf("request-size report omitted merged extra fields: %v", err)
 	}
 }

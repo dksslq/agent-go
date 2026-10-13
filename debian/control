@@ -14,11 +14,8 @@ Upstream-Name: agent-go
 Package: agentlet
 Architecture: any
 Depends: ${misc:Depends}, ${shlibs:Depends}
-Description: nano-sized terminal AI agent (streaming, tool-calling, zero deps)
- agentlet streams answers from any OpenAI-compatible chat API, runs
- tools (exec, image_read, memory_edit) in parallel, accepts image
- attachments, and persists sessions as plain JSON — all in
- ~1700 lines of dependency-free Go, shipped as a single binary.
- .
- No config files, no plugins, no telemetry: one file to read, one
- binary to trust.
+Description: small terminal AI agent with streaming and tools
+ agentlet connects to OpenAI-compatible chat APIs, executes programs,
+ accepts images, and compacts context with model-maintained memory.
+ Sessions preserve full history as JSON. The single binary uses only
+ the Go standard library.

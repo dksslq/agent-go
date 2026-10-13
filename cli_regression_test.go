@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -136,6 +137,27 @@ func TestCLI(t *testing.T) {
 			t.Fatalf("status=%d stderr=%q", code, errout)
 		}
 	})
+	t.Run("interactive checkpoint failure stops further work", func(t *testing.T) {
+		var requests atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			io.Copy(io.Discard, r.Body)
+			io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n")
+		}))
+		defer srv.Close()
+		cmd, _, errout := command(t, srv.URL, "-save", filepath.Join(t.TempDir(), "missing", "s.json"))
+		cmd.Stdin = strings.NewReader("first\nsecond\n")
+		if code := exit(cmd.Run()); code != 1 || !strings.Contains(errout.String(), "checkpoint failed") || requests.Load() > 1 {
+			t.Fatalf("status=%d requests=%d stderr=%q", code, requests.Load(), errout)
+		}
+	})
+	t.Run("manual save failure stops further work", func(t *testing.T) {
+		cmd, _, errout := command(t, "http://127.0.0.1:1")
+		cmd.Stdin = strings.NewReader("/save " + filepath.Join(t.TempDir(), "missing", "s.json") + "\nmust not run\n")
+		if code := exit(cmd.Run()); code != 1 || !strings.Contains(errout.String(), "Save failed") || strings.Contains(errout.String(), "Runtime error") {
+			t.Fatalf("status=%d stderr=%q", code, errout)
+		}
+	})
 	t.Run("environment defaults", func(t *testing.T) {
 		auth := make(chan string, 1)
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -154,6 +176,37 @@ func TestCLI(t *testing.T) {
 		}
 	})
 	if runtime.GOOS == "windows" {
+		t.Run("session conflict fails before reading pipe", func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "s.json")
+			if err := saveSession(path, newSession()); err != nil {
+				t.Fatal(err)
+			}
+			owner, err := reserveSession(path, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer owner.close()
+			reader, writer, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
+			defer writer.Close() // no EOF: ownership must be checked first
+			cmd, _, errout := command(t, "http://127.0.0.1:1", "-pipe", "-continue", path)
+			cmd.Stdin = reader
+			done := make(chan error, 1)
+			go func() { done <- cmd.Run() }()
+			select {
+			case err := <-done:
+				if code := exit(err); code != 1 || !strings.Contains(errout.String(), "checkpoint failed") {
+					t.Fatalf("status=%d stderr=%q", code, errout)
+				}
+			case <-time.After(5 * time.Second):
+				writer.Close()
+				<-done
+				t.Fatal("session conflict waited for stdin")
+			}
+		})
 		return
 	} // Windows console signals need a console.
 	for _, sig := range []os.Signal{os.Interrupt, syscall.SIGTERM} {

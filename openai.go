@@ -181,7 +181,9 @@ func (r deadlineReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func chatStream(parent context.Context, messages []Message) (<-chan StreamEvent, context.CancelFunc, error) {
+// Optional reports run synchronously and receive the exact request JSON byte
+// count. This measures the HTTP payload, not model tokens or context capacity.
+func chatStream(parent context.Context, messages []Message, report ...func(int)) (<-chan StreamEvent, context.CancelFunc, error) {
 	ctx, cancelCause := context.WithCancelCause(parent)
 	deadline := &streamDeadline{timeout: streamIdleTimeout, cancel: cancelCause}
 	stopped := make(chan struct{})
@@ -222,6 +224,11 @@ func chatStream(parent context.Context, messages []Message) (<-chan StreamEvent,
 	if err != nil {
 		cancel()
 		return nil, cancel, fmt.Errorf("marshal request failed: %w", err)
+	}
+	for _, reportSize := range report {
+		if reportSize != nil {
+			reportSize(len(data))
+		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,

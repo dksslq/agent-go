@@ -457,7 +457,7 @@ func TestMemoryEditEndToEnd(t *testing.T) {
 		}
 	}
 	mem := r2[1].(map[string]interface{})["content"].(string)
-	if !strings.Contains(mem, "Semantic memory") || !strings.Contains(mem, "asked to organize") {
+	if !strings.Contains(mem, "Memory (data") || !strings.Contains(mem, "asked to organize") {
 		t.Fatalf("memory header wrong: %q", mem)
 	}
 	if fmt.Sprint(r2[2].(map[string]interface{})["content"]) != "organize" {
