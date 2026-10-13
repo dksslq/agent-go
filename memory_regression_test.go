@@ -23,6 +23,7 @@ func regressionCall(id, name string) ToolCall {
 func regressionSavedTranscript(t *testing.T, s *Session) []Message {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "session.json")
+	t.Cleanup(s.close) // release the owner before TempDir removes its file
 	if err := saveSession(path, s); err != nil {
 		t.Fatal(err)
 	}
