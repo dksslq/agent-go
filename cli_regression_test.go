@@ -199,9 +199,11 @@ func TestCLI(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Run("session conflict fails before reading pipe", func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "s.json")
-			if err := saveSession(path, newSession()); err != nil {
+			initial := newSession()
+			if err := saveSession(path, initial); err != nil {
 				t.Fatal(err)
 			}
+			initial.close()
 			owner, err := reserveSession(path, false)
 			if err != nil {
 				t.Fatal(err)

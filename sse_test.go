@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -432,6 +433,10 @@ func TestMemoryEditEndToEnd(t *testing.T) {
 		},
 		Cursor: 1,
 	}
+	if err := saveSession(filepath.Join(t.TempDir(), "session.json"), sess); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sess.close)
 	if err := runInferenceLoop(context.Background(), sess); err != nil {
 		t.Fatal(err)
 	}
@@ -440,8 +445,8 @@ func TestMemoryEditEndToEnd(t *testing.T) {
 	}
 
 	r1 := bodies[0]["messages"].([]interface{})
-	if len(r1) != 4 {
-		t.Fatalf("round1 saw %d messages, want 4 (no memory header before the first edit)", len(r1))
+	if len(r1) != 5 {
+		t.Fatalf("round1 saw %d messages, want 5 including persistence status", len(r1))
 	}
 
 	// round 2 must see: [system, memory header, user(organize), assistant(tool_calls), tool(result)]

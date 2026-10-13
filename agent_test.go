@@ -181,6 +181,7 @@ func TestSessionRoundTrip(t *testing.T) {
 	if err := saveSession(path, want); err != nil {
 		t.Fatalf("save: %v", err)
 	}
+	want.close()
 	got, err := loadSession(path)
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -264,26 +265,32 @@ func TestLoadSessionLegacyArray(t *testing.T) {
 	if got.Transcript[0].Content != "you are a pirate" || got.Transcript[1].Content == nil {
 		t.Fatalf("legacy content must pass through untouched: %#v", got.Transcript)
 	}
-	if len(got.contextMessages()) != 2 {
-		t.Fatalf("legacy view must show the full transcript: %+v", got.contextMessages())
+	view := got.contextMessages()
+	if len(view) != 3 || view[1].Role != "system" || view[2].Role != "user" {
+		t.Fatalf("legacy view must show the full transcript and persistence state: %+v", view)
 	}
 }
 
-func TestSaveSessionAtomicReplace(t *testing.T) {
+func TestSaveSessionAppendsCheckpoints(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "s.json")
-	if err := saveSession(path, &Session{Transcript: sampleTranscript(), Memory: "one"}); err != nil {
+	s := &Session{Transcript: sampleTranscript(), Memory: "one"}
+	t.Cleanup(s.close)
+	if err := saveSession(path, s); err != nil {
 		t.Fatal(err)
 	}
-	if err := saveSession(path, &Session{Transcript: sampleTranscript(), Memory: "two"}); err != nil {
+	s.Memory = "two"
+	s.Transcript = append(s.Transcript, Message{Role: "assistant", Content: "new evidence"})
+	if err := saveSession(path, s); err != nil {
 		t.Fatal(err)
 	}
-	got, err := loadSession(path)
+	got, err := loadReservedSession(path, s.owner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Memory != "two" {
-		t.Fatalf("overwrite failed: %q", got.Memory)
+	t.Cleanup(got.close)
+	if got.Memory != "two" || got.messageCount() != len(s.Transcript) {
+		t.Fatalf("checkpoint lost new memory or messages: %+v", got)
 	}
 	leftovers, _ := filepath.Glob(filepath.Join(dir, "*.tmp"))
 	if len(leftovers) != 0 {
@@ -536,24 +543,10 @@ func editTestSession() *Session {
 	}
 }
 
-// Compare the portable full history, not the intentionally compact resident tail.
+// Compare persisted full history, not the intentionally compact resident tail.
 func fullTranscript(t *testing.T, s *Session) []Message {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "history.session")
-	if err := saveSession(path, s); err != nil {
-		t.Fatal(err)
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var full struct {
-		Transcript []Message `json:"transcript"`
-	}
-	if err := json.Unmarshal(b, &full); err != nil {
-		t.Fatal(err)
-	}
-	return full.Transcript
+	return regressionSavedTranscript(t, s)
 }
 
 func TestEditMemory(t *testing.T) {
@@ -623,19 +616,19 @@ func TestEditMemory(t *testing.T) {
 func TestContextMessages(t *testing.T) {
 	s := newSession()
 	v := s.contextMessages()
-	if len(v) != 1 || v[0].Role != "system" {
-		t.Fatalf("fresh view must be exactly the system anchor: %+v", v)
+	if len(v) != 2 || v[0].Role != "system" || v[1].Role != "system" || !strings.Contains(v[1].Content.(string), unsavedSessionNotice) {
+		t.Fatalf("fresh view lacks the system anchor or unsaved-session warning: %+v", v)
 	}
 	s.Transcript = append(s.Transcript, Message{Role: "user", Content: "hi"})
 	s.Transcript = append(s.Transcript, Message{Role: "assistant", Content: "hello"})
 	v = s.contextMessages()
-	if len(v) != 3 {
-		t.Fatalf("no memory header while Memory is empty: %+v", v)
+	if len(v) != 4 || !strings.Contains(v[1].Content.(string), unsavedSessionNotice) || v[2].Content != "hi" || v[3].Content != "hello" {
+		t.Fatalf("appending work changed persistence state or history: %+v", v)
 	}
 	s.editMemory("durable facts", 1)
 	v = s.contextMessages()
 	mem, _ := v[1].Content.(string)
-	if len(v) != 4 || v[1].Role != "system" || !strings.Contains(mem, "durable facts") {
+	if len(v) != 4 || v[1].Role != "system" || !strings.Contains(mem, unsavedSessionNotice) || !strings.Contains(mem, memoryHeader+"durable facts") {
 		t.Fatalf("memory header missing or misplaced: %+v", v)
 	}
 }

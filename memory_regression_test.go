@@ -26,17 +26,40 @@ func regressionSavedTranscript(t *testing.T, s *Session) []Message {
 	if err := saveSession(path, s); err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(path)
+	messages, _ := regressionReadSavedState(t, s, path)
+	return messages
+}
+
+func regressionReadSavedState(t *testing.T, s *Session, path string) ([]Message, sessionLogState) {
+	t.Helper()
+	var file *os.File
+	if s != nil && s.owner.matches(path) {
+		file = s.owner.file
+		position, err := file.Seek(0, io.SeekCurrent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Seek(position, io.SeekStart)
+	} else {
+		var err error
+		file, err = os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	var messages []Message
+	state, err := readSessionLog(file, func(_ int, message Message) error {
+		messages = append(messages, message)
+		return nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var wire struct {
-		Transcript []Message `json:"transcript"`
-	}
-	if err := json.Unmarshal(data, &wire); err != nil {
-		t.Fatal(err)
-	}
-	return wire.Transcript
+	return messages, state
 }
 
 func TestMemoryCompactsWithinAutonomousTurn(t *testing.T) {
@@ -45,9 +68,12 @@ func TestMemoryCompactsWithinAutonomousTurn(t *testing.T) {
 		{Role: "user", Content: "finish the autonomous task"},
 		{Role: "assistant", ToolCalls: []ToolCall{regressionCall("exec1", "exec")}},
 		{Role: "tool", ToolCallID: "exec1", Name: "exec", Content: strings.Repeat("large result", 10000)},
-		{Role: "assistant", ToolCalls: []ToolCall{regressionCall("memory1", "memory_edit")}},
 	}}
 	t.Cleanup(s.close)
+	if err := saveSession(filepath.Join(t.TempDir(), "live.json"), s); err != nil {
+		t.Fatal(err)
+	}
+	s.Transcript = append(s.Transcript, Message{Role: "assistant", ToolCalls: []ToolCall{regressionCall("memory1", "memory_edit")}})
 	original := append([]Message(nil), s.Transcript...)
 	result := s.editMemory("Objective: finish autonomous task. exec1 succeeded. Next: continue.", 0)
 	if strings.HasPrefix(result, "Error") || s.Cursor != 4 || s.messageCount() != 5 || len(s.Transcript) != 2 {
@@ -65,17 +91,21 @@ func TestMemoryCompactsWithinAutonomousTurn(t *testing.T) {
 		t.Fatalf("next request has a broken tool group: %#v", view)
 	}
 
-	// Repeated compactions keep absolute indices and append only new archive
+	// Repeated compactions keep absolute indices and append only new journal
 	// entries even after a saved session is loaded again.
 	path := filepath.Join(t.TempDir(), "resume.json")
 	if err := saveSession(path, s); err != nil {
 		t.Fatal(err)
 	}
+	s.close()
 	loaded, err := loadSession(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(loaded.close)
+	if err := saveSession(filepath.Join(t.TempDir(), "continued.json"), loaded); err != nil {
+		t.Fatal(err)
+	}
 	loaded.Transcript = append(loaded.Transcript, Message{Role: "assistant", ToolCalls: []ToolCall{regressionCall("memory2", "memory_edit")}})
 	original = append(original, loaded.Transcript[len(loaded.Transcript)-1])
 	result = loaded.editMemory("Objective retained; both earlier operations succeeded.", 0)
@@ -86,7 +116,7 @@ func TestMemoryCompactsWithinAutonomousTurn(t *testing.T) {
 	loaded.Transcript = append(loaded.Transcript, last)
 	original = append(original, last)
 	if got := regressionSavedTranscript(t, loaded); !reflect.DeepEqual(got, original) {
-		t.Fatal("archive replay duplicated or lost messages after resume")
+		t.Fatal("journal replay duplicated or lost messages after resume")
 	}
 }
 
@@ -110,49 +140,47 @@ func TestMemoryCursorSkipsWholeParallelToolGroup(t *testing.T) {
 	}
 }
 
-func TestMemoryArchiveFailureLeavesStateIntact(t *testing.T) {
+func TestMemoryPersistenceFailureLeavesStateIntact(t *testing.T) {
 	s := newSession()
 	s.Transcript = append(s.Transcript, Message{Role: "user", Content: "retain me"})
-	path := filepath.Join(t.TempDir(), "read-only-history.jsonl")
-	if err := os.WriteFile(path, []byte(`{"role":"system","content":"s"}`+"\n"), 0o600); err != nil {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.json")
+	if err := saveSession(path, s); err != nil {
 		t.Fatal(err)
 	}
-	file, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.archive, s.archiveEntries = file, 1
 	t.Cleanup(s.close)
+	oldDiskCount := s.diskCount
+	s.saveFile = filepath.Join(dir, "missing", "session.json")
 	before := append([]Message(nil), s.Transcript...)
 	if got := s.editMemory("new memory", 0); !strings.HasPrefix(got, "Error") {
-		t.Fatalf("failed archive write reported success: %s", got)
+		t.Fatalf("failed checkpoint write reported success: %s", got)
 	}
-	if s.Memory != "" || s.Cursor != 1 || s.archived != 0 || !reflect.DeepEqual(before, s.Transcript) {
+	if s.Memory != "" || s.Cursor != 1 || s.archived != 0 || s.diskCount != oldDiskCount || !reflect.DeepEqual(before, s.Transcript) {
 		t.Fatal("failed compaction discarded live history")
 	}
+	onlyExplicitFile(t, dir, "session.json")
 }
 
-func TestFirstArchiveFailureRemovesTemporaryFile(t *testing.T) {
+func TestInvalidPersistedCompactionCreatesNoFile(t *testing.T) {
 	dir := t.TempDir()
-	for _, variable := range []string{"TMPDIR", "TMP", "TEMP"} {
-		t.Setenv(variable, dir)
-	}
+	noImplicitTemp(t, dir)
 	s := newSession()
 	defer s.close()
+	s.saveFile = filepath.Join(dir, "session.json")
 	s.Transcript = append(s.Transcript, Message{Role: "user", Content: func() {}})
 	if result := s.editMemory("retain task", 0); !strings.HasPrefix(result, "Error") {
-		t.Fatalf("invalid history archived: %s", result)
+		t.Fatalf("invalid history persisted: %s", result)
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 0 || s.archive != nil || s.Memory != "" || s.Cursor != 1 || len(s.Transcript) != 2 {
-		t.Fatal("failed first archive left files or changed session state")
+	if len(entries) != 0 || s.Memory != "" || s.Cursor != 1 || len(s.Transcript) != 2 {
+		t.Fatal("invalid compaction left files or changed session state")
 	}
 }
 
-func TestSessionSavePrivateUniqueAndConcurrent(t *testing.T) {
+func TestConcurrentNewSessionSaveDoesNotClobber(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "session.json")
 	oldTmp := path + ".tmp"
@@ -166,19 +194,16 @@ func TestSessionSavePrivateUniqueAndConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			s := newSession()
+			defer s.close()
 			s.Transcript = append(s.Transcript, Message{Role: "user", Content: "concurrent save"})
-			if err := saveSession(path, s); err != nil {
-				if runtime.GOOS != "windows" {
-					t.Errorf("save: %v", err)
-				}
-			} else {
+			if err := saveSession(path, s); err == nil {
 				successes.Add(1)
 			}
 		}()
 	}
 	wg.Wait()
-	if successes.Load() == 0 {
-		t.Fatal("no concurrent writer could save a valid session")
+	if successes.Load() != 1 {
+		t.Fatalf("expected one new-file writer, got %d", successes.Load())
 	}
 	s, err := loadSession(path)
 	if err != nil {
@@ -207,9 +232,11 @@ func TestSessionSavePrivateUniqueAndConcurrent(t *testing.T) {
 
 func TestInvalidSessionCannotReplaceSavedState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session.json")
-	if err := saveSession(path, newSession()); err != nil {
+	saved := newSession()
+	if err := saveSession(path, saved); err != nil {
 		t.Fatal(err)
 	}
+	saved.close()
 	before, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -228,7 +255,7 @@ func TestInvalidSessionCannotReplaceSavedState(t *testing.T) {
 func TestLoadRejectsInvalidSessionSemantics(t *testing.T) {
 	cases := []string{
 		`null`, `{}`, `[]`,
-		`{"version":4,"transcript":[{"role":"system","content":"s"}]}`,
+		`{"version":` + strconv.Itoa(sessionVersion+1) + `,"transcript":[{"role":"system","content":"s"}]}`,
 		`{"transcript":[{"role":"user","content":"u"}]}`,
 		`{"transcript":[{"role":"system"},{"role":"unknown"}]}`,
 		`{"transcript":[{"role":"system","content":{"invalid":"shape"}}]}`,
@@ -273,9 +300,11 @@ func TestLoadStreamingReleasesAbsorbedHistory(t *testing.T) {
 	}
 	s.Memory = "Task context retained."
 	s.Cursor = len(s.Transcript)
+	original := append([]Message(nil), s.Transcript...)
 	if err := saveSession(path, s); err != nil {
 		t.Fatal(err)
 	}
+	s.close()
 	loaded, err := loadSession(path)
 	if err != nil {
 		t.Fatal(err)
@@ -284,17 +313,13 @@ func TestLoadStreamingReleasesAbsorbedHistory(t *testing.T) {
 	if len(loaded.Transcript) != 1 || loaded.messageCount() != s.messageCount() || loaded.Cursor != s.Cursor {
 		t.Fatalf("load retained absorbed payloads or lost history: %+v", loaded)
 	}
-	if got := regressionSavedTranscript(t, loaded); !reflect.DeepEqual(got, s.Transcript) {
+	if got := regressionSavedTranscript(t, loaded); !reflect.DeepEqual(got, original) {
 		t.Fatal("large archived transcript did not survive streaming roundtrip")
 	}
-	archivePath := loaded.archive.Name()
-	file := loaded.archive
+	source := loaded.sourcePath
 	loaded.close()
-	if _, err := os.Stat(archivePath); !os.IsNotExist(err) {
-		t.Fatalf("archive temporary file leaked: %v", err)
-	}
-	if _, err := file.WriteString("after close"); err == nil {
-		t.Fatal("archive descriptor leaked")
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("closing a session removed its explicit history file: %v", err)
 	}
 }
 
@@ -311,6 +336,7 @@ func TestLoadCursorNormalizesPastToolResults(t *testing.T) {
 	if err := saveSession(path, s); err != nil {
 		t.Fatal(err)
 	}
+	s.close()
 	loaded, err := loadSession(path)
 	if err != nil {
 		t.Fatal(err)
@@ -327,9 +353,11 @@ func TestSessionCannotHideHistoryWithoutMemory(t *testing.T) {
 		s.Transcript = append(s.Transcript, Message{Role: "user", Content: "important objective"}, Message{Role: "assistant", Content: "important evidence"})
 		s.Cursor, s.Memory = 3, memory
 		path := filepath.Join(t.TempDir(), "session.json")
-		if err := saveSession(path, newSession()); err != nil {
+		saved := newSession()
+		if err := saveSession(path, saved); err != nil {
 			t.Fatal(err)
 		}
+		saved.close()
 		before, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
@@ -355,52 +383,59 @@ func TestSessionCannotHideHistoryWithoutMemory(t *testing.T) {
 	}
 }
 
-func TestReloadMemoryHeaderDiscoversCurrentArchive(t *testing.T) {
+func TestReloadMemoryHeaderDiscoversExplicitHistory(t *testing.T) {
 	s := newSession()
 	t.Cleanup(s.close)
 	s.Transcript = append(s.Transcript,
 		Message{Role: "user", Content: "objective and original detail"},
 		Message{Role: "assistant", Content: "earlier evidence"},
-		Message{Role: "assistant", ToolCalls: []ToolCall{regressionCall("m", "memory_edit")}},
 	)
+	oldPath := filepath.Join(t.TempDir(), "original.json")
+	if err := saveSession(oldPath, s); err != nil {
+		t.Fatal(err)
+	}
+	s.Transcript = append(s.Transcript, Message{Role: "assistant", ToolCalls: []ToolCall{regressionCall("m", "memory_edit")}})
 	result := s.editMemory("Preserved objective and earlier evidence.", 0)
-	oldPath := s.archive.Name()
-	s.Transcript = append(s.Transcript, Message{Role: "tool", ToolCallID: "m", Name: "memory_edit", Content: result + "\nHistorical archive: " + strconv.Quote(oldPath)})
+	s.Transcript = append(s.Transcript, Message{Role: "tool", ToolCallID: "m", Name: "memory_edit", Content: result + "\nHistorical session: " + strconv.Quote(oldPath)})
 	path := filepath.Join(t.TempDir(), "session.json")
 	if err := saveSession(path, s); err != nil {
 		t.Fatal(err)
 	}
+	s.close()
 	loaded, err := loadSession(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(loaded.close)
-	currentPath := loaded.archive.Name()
+	currentPath := loaded.sourcePath
 	if oldPath == currentPath {
-		t.Fatal("reload reused a stale process-local archive path")
+		t.Fatal("save-as retained its original history path")
 	}
 	view := loaded.contextMessages()
 	header, ok := view[1].Content.(string)
 	if !ok || !strings.Contains(header, strconv.Quote(currentPath)) || strings.Contains(header, strconv.Quote(oldPath)) {
-		t.Fatalf("current archive cannot be discovered from memory header: %q", header)
+		t.Fatalf("explicit history cannot be discovered from memory header: %q", header)
 	}
 	if !strings.Contains(view[3].Content.(string), strconv.Quote(oldPath)) {
 		t.Fatal("test did not retain the historical stale tool-report path")
 	}
 	if _, err := os.Stat(currentPath); err != nil {
-		t.Fatalf("advertised current archive is unavailable: %v", err)
+		t.Fatalf("advertised history is unavailable: %v", err)
 	}
 	// Appending work must preserve the memory header byte-for-byte so the path
 	// is discoverable without making every new request lose its stable prefix.
 	loaded.Transcript = append(loaded.Transcript, Message{Role: "assistant", Content: "continue"})
 	if next := loaded.contextMessages(); next[1].Content != header {
-		t.Fatal("an append changed the archive/memory prefix")
+		t.Fatal("an append changed the history/memory prefix")
 	}
 }
 
 func TestMemoryDefaultCompactionCheckpointAndResume(t *testing.T) {
 	withStreamDefaults(t)
 	checkpoint := filepath.Join(t.TempDir(), "session.json")
+	s := newSession()
+	t.Cleanup(s.close)
+	s.saveFile = checkpoint
 	var phase atomic.Int32
 	withSSEServer(t, func(w http.ResponseWriter, r *http.Request) {
 		switch phase.Add(1) {
@@ -417,23 +452,15 @@ func TestMemoryDefaultCompactionCheckpointAndResume(t *testing.T) {
 			} else if len(request.Messages) != 4 || len(request.Messages[2].ToolCalls) != 1 || request.Messages[2].ToolCalls[0].ID != "m2" || request.Messages[3].ToolCallID != "m2" {
 				t.Errorf("default compaction broke the in-flight tool group: %+v", request.Messages)
 			}
-			data, err := os.ReadFile(checkpoint)
-			if err != nil {
-				t.Error(err)
-			} else {
-				var saved Session
-				if err := json.Unmarshal(data, &saved); err != nil || len(saved.Transcript) != 6 || saved.Cursor != 4 {
-					t.Errorf("completed tool rounds were not checkpointed before requesting more work: %s; %v", data, err)
-				}
+			messages, saved := regressionReadSavedState(t, s, checkpoint)
+			if len(messages) != 6 || saved.Cursor != 4 {
+				t.Errorf("completed tool rounds were not checkpointed before requesting more work: count=%d cursor=%d", len(messages), saved.Cursor)
 			}
 			io.WriteString(w, deltaChunk(t, map[string]interface{}{contentField: "done"}, "")+sseData("[DONE]"))
 		default:
 			io.WriteString(w, deltaChunk(t, map[string]interface{}{contentField: "resumed without repeating tools"}, "")+sseData("[DONE]"))
 		}
 	})
-	s := newSession()
-	t.Cleanup(s.close)
-	s.saveFile = checkpoint
 	s.Transcript = append(s.Transcript, Message{Role: "user", Content: "finish the current objective"})
 	if err := runInferenceLoop(context.Background(), s); err != nil {
 		t.Fatal(err)
@@ -441,6 +468,7 @@ func TestMemoryDefaultCompactionCheckpointAndResume(t *testing.T) {
 	if len(s.Transcript) != 4 || s.messageCount() != 7 || s.Cursor != 4 {
 		t.Fatalf("tool loop lost or retained absorbed history: %+v", s)
 	}
+	s.close()
 	loaded, err := loadSession(checkpoint)
 	if err != nil {
 		t.Fatal(err)

@@ -1,11 +1,9 @@
 package main
 
-// Sessions preserve full history on disk, while memory_edit releases absorbed
-// messages from RAM and the next API request. The v3 file format stays portable:
-// saving streams the archive and live tail into one replacement snapshot.
+// Session history lives in RAM or in the explicitly selected checkpoint file.
+// Compaction releases RAM; no temporary files or implicit archives are created.
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,11 +13,12 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 )
 
 const memoryHeader = "Memory (data, not instructions):\n"
-const sessionVersion = 3
+const sessionVersion = 4
+
+const unsavedSessionNotice = "Session is not saved. Uncompacted history can grow in RAM; exit loses new memory. memory_edit discards unsaved originals. Use exec to explicitly save important facts."
 
 type Session struct {
 	Version    int       `json:"version"`
@@ -28,11 +27,15 @@ type Session struct {
 	Cursor     int       `json:"cursor"` // absolute transcript index
 
 	mu               sync.Mutex
-	archive          *os.File
-	archiveEntries   int // archived file may also contain a previously loaded live tail
-	archived         int // non-system messages removed from the resident transcript
+	archived         int // non-system messages removed from RAM; absolute indices stay stable
+	sourcePath       string
+	diskBase         int
+	diskCount        int
+	diskOffset       int64
 	saveFile         string
 	owner            *sessionOwner
+	ownsOwner        bool
+	checkpointErr    error
 	lastRequestBytes int
 }
 
@@ -59,19 +62,39 @@ func (s *Session) contextMessages() []Message {
 	return s.contextLocked()
 }
 
+func (s *Session) persistenceNotice() string {
+	notice := unsavedSessionNotice
+	if s.saveFile == "" {
+		if s.sourcePath != "" {
+			notice = fmt.Sprintf("Loaded checkpoint: %q. ", s.sourcePath) + notice
+		}
+	} else {
+		notice = fmt.Sprintf("Session checkpoints: %q. Completed history is saved before compaction.", s.saveFile)
+		if s.owner != nil && s.owner.exclusive() {
+			notice += " The file is held exclusively; exec cannot open it."
+		}
+	}
+	if s.diskBase > 0 {
+		notice += " Earlier unsaved originals are unavailable."
+	}
+	return notice
+}
+
 func (s *Session) contextLocked() []Message {
 	if len(s.Transcript) == 0 {
 		return nil
 	}
 	out := make([]Message, 0, 2+len(s.Transcript)-s.residentCursor())
 	out = append(out, s.Transcript[0])
-	if s.Memory != "" {
-		memory := memoryHeader + s.Memory
-		if s.archive != nil {
-			memory += fmt.Sprintf("\nArchive (JSONL): %q", s.archive.Name())
-		}
-		out = append(out, Message{Role: "system", Content: memory})
+	directory, err := os.Getwd()
+	if err != nil {
+		directory = "[unavailable]"
 	}
+	state := fmt.Sprintf("Runtime: %s/%s; default cwd=%q.\n", runtime.GOOS, runtime.GOARCH, directory) + s.persistenceNotice()
+	if s.Memory != "" {
+		state += "\n" + memoryHeader + s.Memory
+	}
+	out = append(out, Message{Role: "system", Content: state})
 	return append(out, s.Transcript[s.residentCursor():]...)
 }
 
@@ -85,7 +108,7 @@ func (s *Session) contextBytes() int {
 // the assistant currently awaiting results must remain until its tools finish.
 func (s *Session) safeCursor(cursor int) int {
 	max := s.messageCount()
-	for i := s.residentCursor(); i < len(s.Transcript); i++ {
+	for i := 1; i < len(s.Transcript); i++ {
 		calls := s.Transcript[i].ToolCalls
 		if len(calls) == 0 {
 			continue
@@ -133,78 +156,39 @@ func (s *Session) editMemory(memory string, cursor int) string {
 	}
 	old := s.Cursor
 	cursor = s.safeCursor(cursor)
-	if err := s.compactLocked(cursor); err != nil {
-		return fmt.Sprintf("Error: memory unchanged; cannot archive transcript: %v", err)
+	if s.saveFile != "" {
+		if err := s.checkpointLocked(s.saveFile, memory, cursor, cursor); err != nil {
+			s.checkpointErr = err
+			return fmt.Sprintf("Error: memory unchanged; checkpoint failed: %v", err)
+		}
+	} else if cursor > s.diskCount {
+		// Unsaved originals are gone; a later save can only retain this suffix.
+		s.sourcePath, s.diskCount, s.diskBase, s.diskOffset = "", 0, 0, 0
 	}
+	s.compactLocked(cursor)
 	s.Memory, s.Cursor = memory, cursor
 	view := s.contextLocked()
 	b, _ := json.Marshal(view)
 	return fmt.Sprintf("Cursor %d -> %d; next=%d; context_bytes=%d.", old, cursor, s.messageCount(), len(b))
 }
 
-func (s *Session) compactLocked(cursor int) (resultErr error) {
-	created := false
-	defer func() {
-		if resultErr != nil && created {
-			name := s.archive.Name()
-			s.archive.Close()
-			os.Remove(name)
-			s.archive = nil
-		}
-	}()
+func (s *Session) compactLocked(cursor int) {
 	if cursor <= s.archived+1 {
-		return nil
+		return
 	}
-	if s.archive == nil {
-		f, err := os.CreateTemp("", "agentlet-history-*.jsonl")
-		if err != nil {
-			return err
-		}
-		s.archive = f
-		created = true
-	}
-	if cursor > s.archiveEntries {
-		stat, err := s.archive.Stat()
-		if err != nil {
-			return err
-		}
-		enc := json.NewEncoder(s.archive)
-		enc.SetEscapeHTML(false)
-		for i := s.archiveEntries; i < cursor; i++ {
-			idx := i - s.archived
-			if i == 0 {
-				idx = 0
-			}
-			if err := enc.Encode(s.Transcript[idx]); err != nil {
-				s.archive.Truncate(stat.Size())
-				s.archive.Seek(stat.Size(), io.SeekStart)
-				return err
-			}
-		}
-		if err := s.archive.Sync(); err != nil {
-			s.archive.Truncate(stat.Size())
-			s.archive.Seek(stat.Size(), io.SeekStart)
-			return err
-		}
-		s.archiveEntries = cursor
-	}
-	// Copy, rather than reslice: the old backing array otherwise retains every
-	// absorbed string/image/tool result and prevents garbage collection.
 	tail := make([]Message, 1, 1+len(s.Transcript)-(cursor-s.archived))
 	tail[0] = s.Transcript[0]
 	s.Transcript = append(tail, s.Transcript[cursor-s.archived:]...)
 	s.archived = cursor - 1
-	return nil
 }
 
 func (s *Session) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.archive != nil {
-		name := s.archive.Name()
-		s.archive.Close()
-		os.Remove(name)
-		s.archive = nil
+	if s.ownsOwner {
+		s.owner.close()
+		s.ownsOwner = false
+		s.owner = nil
 	}
 }
 
@@ -317,118 +301,132 @@ func (v *transcriptValidator) finish() error {
 	return nil
 }
 
-// Private snapshots avoid symlink-following and user .tmp clobbering. Sync
-// before replacement; Unix rename is atomic, Windows follows its OS guarantees.
+// Writes only the user-selected file. Existing unrelated paths are never overwritten.
 func saveSession(path string, s *Session) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cursor := s.Cursor
-	if cursor < 1 {
-		cursor = 1
+	if s.checkpointErr != nil {
+		return s.checkpointErr
 	}
-	cursor = s.safeCursor(cursor)
-	if cursor > 1 && strings.TrimSpace(s.Memory) == "" {
+	cursor := s.safeCursor(s.Cursor)
+	if err := s.checkpointLocked(path, s.Memory, cursor, s.messageCount()); err != nil {
+		return err
+	}
+	s.saveFile = s.sourcePath
+	s.Cursor = cursor
+	return nil
+}
+
+func (s *Session) sourceFile() (*os.File, bool, error) {
+	if s.owner.matches(s.sourcePath) {
+		return s.owner.file, false, nil
+	}
+	f, err := os.Open(s.sourcePath)
+	return f, true, err
+}
+
+func (s *Session) checkpointLocked(path, memory string, cursor, limit int) error {
+	if s.checkpointErr != nil {
+		return s.checkpointErr
+	}
+	if cursor > 1 && strings.TrimSpace(memory) == "" {
 		return errors.New("compacted session requires semantic memory")
 	}
-	owner := s.owner
-	if !owner.matches(path) {
-		var err error
-		owner, err = reserveSession(path, true)
-		if err != nil {
-			return err
-		}
-		defer owner.close()
-	}
-	f, err := createSessionTemp(path)
+	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return err
 	}
-	committed := false
-	defer func() {
-		if !committed {
-			f.Close()
-			os.Remove(f.Name())
-		}
-	}()
-	w := bufio.NewWriter(f)
-	fmt.Fprintf(w, `{"version":%d,"transcript":[`, sessionVersion)
-	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(false)
+	end := limit - s.archived
+	if end < 1 || end > len(s.Transcript) {
+		return errors.New("invalid checkpoint boundary")
+	}
+	// Validate before creating even the explicitly requested output.
 	v := transcriptValidator{}
-	write := func(m Message) error {
+	for _, m := range s.Transcript[:end] {
 		if err := v.add(m); err != nil {
-			return err
-		}
-		if v.count > 1 {
-			if _, err := w.WriteString(","); err != nil {
-				return err
-			}
-		}
-		return enc.Encode(m)
-	}
-	start := 0
-	if s.archived > 0 {
-		if s.archive == nil {
-			return errors.New("session archive is closed")
-		}
-		stat, err := s.archive.Stat()
-		if err != nil {
-			return err
-		}
-		dec := json.NewDecoder(io.NewSectionReader(s.archive, 0, stat.Size()))
-		for i := 0; i <= s.archived; i++ {
-			var m Message
-			if err := dec.Decode(&m); err != nil {
-				return fmt.Errorf("read session archive: %w", err)
-			}
-			if err := write(m); err != nil {
-				return err
-			}
-		}
-		start = 1
-	}
-	for _, m := range s.Transcript[start:] {
-		if err := write(m); err != nil {
 			return err
 		}
 	}
 	if err := v.finish(); err != nil {
 		return err
 	}
-	memory, err := json.Marshal(s.Memory)
-	if err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(w, `],"memory":%s,"cursor":%d}`, memory, cursor); err != nil {
-		return err
-	}
-	if err := w.Flush(); err != nil {
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		return err
-	}
-	if err := commitSession(path, f, owner); err != nil {
-		return err
-	}
-	committed = true
-	s.Version = sessionVersion
-	if runtime.GOOS != "windows" {
-		dir, err := os.Open(filepath.Dir(path))
+	owner := s.owner
+	acquired := !owner.matches(absolute)
+	if acquired {
+		owner, err = reserveSession(absolute, true)
 		if err != nil {
 			return err
 		}
-		defer dir.Close()
-		if err := dir.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.ENOTSUP) {
+	}
+	success := false
+	defer func() {
+		if acquired && !success {
+			owner.close()
+		}
+	}()
+	base, count, offset := s.diskBase, s.diskCount, s.diskOffset
+	sameSource := s.sourcePath != "" && owner.matches(s.sourcePath)
+	if !sameSource {
+		if !owner.createdNew() {
+			return errors.New("save path already exists; resume it or choose a new path")
+		}
+		if s.sourcePath != "" {
+			source, closeSource, err := s.sourceFile()
+			if err != nil {
+				return err
+			}
+			if closeSource {
+				defer source.Close()
+			}
+			if _, err := owner.file.Seek(0, io.SeekStart); err != nil {
+				return err
+			}
+			if _, err := io.CopyN(owner.file, io.NewSectionReader(source, 0, s.diskOffset), s.diskOffset); err != nil {
+				return err
+			}
+		} else {
+			base, count, offset = s.archived, 0, 0
+		}
+	}
+	start := 0
+	if count > 0 {
+		start = count - s.archived
+		if start < 1 || start > len(s.Transcript) {
+			return errors.New("saved history does not match resident suffix")
+		}
+	}
+	if start > end {
+		end = start
+	} // earlier compaction may already be durable
+	cp := sessionCheckpoint{Version: sessionVersion, Base: base, Start: count, Messages: s.Transcript[start:end], Memory: memory, Cursor: cursor}
+	nextOffset, err := appendSessionCheckpoint(owner.file, offset, cp)
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		count = base + len(cp.Messages)
+	} else {
+		count += len(cp.Messages)
+	}
+	if owner.createdNew() {
+		if err := syncSessionDirectory(owner.path); err != nil {
 			return err
 		}
+	}
+	previous := s.owner
+	previousOwned := s.ownsOwner
+	s.owner, s.ownsOwner = owner, acquired || previousOwned
+	s.sourcePath, s.diskBase, s.diskCount, s.diskOffset = absolute, base, count, nextOffset
+	s.Version = sessionVersion
+	owner.created = false
+	success = true
+	if acquired && previous != nil {
+		previous.close()
 	}
 	return nil
 }
 
-// Decode message-by-message to a private spool, then retain only the active
-// suffix. Field order in old v3 files does not require loading their history.
-func loadSession(path string) (_ *Session, retErr error) {
+func loadSession(path string) (*Session, error) {
 	stat, err := os.Stat(path)
 	if err != nil {
 		return nil, err
@@ -448,154 +446,43 @@ func loadReservedSession(path string, owner *sessionOwner) (*Session, error) {
 	if !owner.matches(path) {
 		return loadSession(path)
 	}
-	if _, err := owner.file.Seek(0, io.SeekStart); err != nil {
-		return nil, err
+	s, err := decodeSession(owner.file)
+	if s != nil {
+		s.sourcePath = owner.path
 	}
-	return decodeSession(owner.file)
+	return s, err
 }
 
-func decodeSession(f *os.File) (_ *Session, retErr error) {
-	stat, err := f.Stat()
+func decodeSession(f *os.File) (*Session, error) {
+	state, err := readSessionLog(f, nil)
 	if err != nil {
 		return nil, err
 	}
-	if !stat.Mode().IsRegular() {
-		return nil, errors.New("session must be a regular file")
-	}
-	d := json.NewDecoder(f)
-	token, err := d.Token()
-	if err == io.EOF {
+	if state.Count == 0 {
 		return nil, nil
 	}
-	if err != nil {
-		return nil, fmt.Errorf("invalid session JSON: %w", err)
-	}
-	s := &Session{}
-	defer func() {
-		if retErr != nil {
-			s.close()
+	s := &Session{Version: state.Version, Memory: state.Memory, Cursor: state.Cursor, sourcePath: f.Name(), diskBase: state.Base, diskCount: state.Count, diskOffset: state.Offset}
+	_, err = readSessionLog(f, func(index int, m Message) error {
+		if index == s.Cursor && m.Role == "tool" {
+			s.Cursor++
 		}
-	}()
-	v := transcriptValidator{}
-	readTranscript := func() error {
-		archive, err := os.CreateTemp("", "agentlet-history-*.jsonl")
-		if err != nil {
-			return err
-		}
-		s.archive = archive
-		enc := json.NewEncoder(archive)
-		enc.SetEscapeHTML(false)
-		for d.More() {
-			var m Message
-			if err := d.Decode(&m); err != nil {
-				return err
-			}
-			if err := v.add(m); err != nil {
-				return err
-			}
-			if err := enc.Encode(m); err != nil {
-				return err
-			}
-		}
-		end, err := d.Token()
-		if err != nil || end != json.Delim(']') {
-			return errors.New("invalid transcript array")
-		}
-		return v.finish()
-	}
-	switch token {
-	case json.Delim('['): // Legacy flat-array sessions retain their custom anchor.
-		err = readTranscript()
-		s.Cursor = 1
-	case json.Delim('{'):
-		seen := make(map[string]bool)
-		for d.More() && err == nil {
-			key, e := d.Token()
-			if e != nil {
-				err = e
-				break
-			}
-			name, ok := key.(string)
-			known := name == "version" || name == "memory" || name == "cursor" || name == "transcript"
-			if !ok || known && seen[name] {
-				err = errors.New("invalid or duplicate session field")
-				break
-			}
-			if known {
-				seen[name] = true
-			}
-			switch name {
-			case "version":
-				err = d.Decode(&s.Version)
-			case "memory":
-				err = d.Decode(&s.Memory)
-			case "cursor":
-				err = d.Decode(&s.Cursor)
-			case "transcript":
-				var start json.Token
-				start, err = d.Token()
-				if err == nil && start != json.Delim('[') {
-					err = errors.New("transcript must be an array")
-				}
-				if err == nil {
-					err = readTranscript()
-				}
-			default:
-				err = skipJSONValue(d)
-			}
-		}
-		if err == nil {
-			_, err = d.Token()
-		}
-		if err == nil && !seen["transcript"] {
-			err = errors.New("missing transcript")
-		}
-	default:
-		err = errors.New("session must be an object or legacy array")
-	}
-	if err == nil {
-		if _, e := d.Token(); e != io.EOF {
-			err = errors.New("trailing data after session")
-		}
-	}
-	if err != nil {
-		return nil, fmt.Errorf("invalid session JSON: %w", err)
-	}
-	if s.Version < 0 || s.Version > sessionVersion {
-		return nil, fmt.Errorf("unsupported session version %d", s.Version)
-	}
-	s.archiveEntries = v.count
-	if s.Cursor < 1 {
-		s.Cursor = 1
-	}
-	if s.Cursor > v.count {
-		s.Cursor = v.count
-	}
-	stat, err = s.archive.Stat()
-	if err != nil {
-		return nil, err
-	}
-	dec := json.NewDecoder(io.NewSectionReader(s.archive, 0, stat.Size()))
-	for i := 0; i < v.count; i++ {
-		var m Message
-		if err := dec.Decode(&m); err != nil {
-			return nil, fmt.Errorf("read session archive: %w", err)
-		}
-		if i == s.Cursor && m.Role == "tool" {
-			s.Cursor++ // move past the whole group, never expose an orphan result
-		}
-		if i == 0 || i >= s.Cursor {
+		if index == 0 || index >= s.Cursor {
 			s.Transcript = append(s.Transcript, m)
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	s.archived = s.Cursor - 1
 	if s.Cursor > 1 && strings.TrimSpace(s.Memory) == "" {
 		return nil, errors.New("compacted session requires semantic memory")
 	}
-	if s.archived == 0 {
-		s.close()
-		s.archiveEntries = 0
+	absolute, err := filepath.Abs(s.sourcePath)
+	if err != nil {
+		return nil, err
 	}
+	s.sourcePath = absolute
 	return s, nil
 }
 

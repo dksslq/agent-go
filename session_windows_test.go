@@ -52,6 +52,7 @@ func TestWindowsSessionOwnership(t *testing.T) {
 	if err := saveSession(path, initial); err != nil {
 		t.Fatal(err)
 	}
+	initial.close()
 	before, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -100,7 +101,7 @@ func TestWindowsSessionOwnership(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		s.Transcript = append(s.Transcript, Message{Role: "assistant", Content: fmt.Sprintf("checkpoint %d", i)})
 		if err := saveSession(path, s); err != nil {
-			t.Fatalf("owned atomic checkpoint failed: %v", err)
+			t.Fatalf("owned append checkpoint failed: %v", err)
 		}
 		loaded, err := loadReservedSession(path, owner)
 		if err != nil {
@@ -176,31 +177,25 @@ func TestWindowsReservationRollbackAndCommit(t *testing.T) {
 	loaded.close()
 }
 
-func TestWindowsPlaceholderCleanupPreservesOutsideReplacement(t *testing.T) {
+func TestWindowsOwnershipDeniesPathReplacement(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "session.json")
-	moved := filepath.Join(dir, "moved-placeholder.json")
+	moved := filepath.Join(dir, "moved.json")
 	owner, err := reserveSession(path, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer owner.close()
-	// DELETE sharing permits outside renames; cleanup must still address the
-	// owned file object rather than deleting this new, unrelated pathname.
-	if err := os.Rename(path, moved); err != nil {
-		t.Fatal(err)
+	if err := os.Rename(path, moved); err == nil {
+		t.Fatal("exclusive file allowed path replacement")
 	}
-	if err := os.WriteFile(path, []byte("outside replacement"), 0o600); err != nil {
-		t.Fatal(err)
+	if err := os.Remove(path); err == nil {
+		t.Fatal("exclusive file allowed deletion")
 	}
 	if err := owner.close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(moved); !os.IsNotExist(err) {
-		t.Fatalf("owned placeholder object was not deleted: %v", err)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil || string(data) != "outside replacement" {
-		t.Fatal("placeholder cleanup deleted an unrelated replacement")
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("unused selected placeholder remained: %v", err)
 	}
 }

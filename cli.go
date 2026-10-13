@@ -21,7 +21,7 @@ import (
 func main() { os.Exit(run(os.Args[1:])) }
 
 // Keep exit decisions outside resource-owning code, so terminal restoration,
-// archive cleanup and HTTP cleanup run on errors and signals too.
+// session and HTTP cleanup run on errors and signals too.
 func run(args []string) (status int) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -130,7 +130,7 @@ func run(args []string) (status int) {
 			saveFile = *resume
 		}
 	}
-	// Claim the selected Windows output before reading stdin or starting work.
+	// Open only the explicitly selected output before reading stdin or starting work.
 	owner, err := reserveSession(saveFile, true)
 	if err != nil {
 		infof("checkpoint failed: %v\n", err)
@@ -166,7 +166,14 @@ func run(args []string) (status int) {
 			return 1
 		}
 	}
+	if owner != nil && !owner.createdNew() && !(loadFile != "" && owner.matches(loadFile)) {
+		infof("checkpoint failed: save path already exists; use -continue or load the same file\n")
+		return 1
+	}
 	sess.saveFile, sess.owner = saveFile, owner
+	if owner != nil {
+		sess.saveFile = owner.path
+	}
 	if *pipe {
 		p, err := readInput(ctx, func() (string, error) { return pipePrompt(*prompt, os.Stdin) })
 		if err != nil {
@@ -192,6 +199,7 @@ func run(args []string) (status int) {
 			}
 		}
 	}
+	infof("%s\n", sess.persistenceNotice())
 	showSystemPrompt(sess.Transcript)
 	turn := func(msg Message) error {
 		before := len(sess.Transcript)
@@ -208,8 +216,8 @@ func run(args []string) (status int) {
 		} else {
 			clearPending()
 		}
-		if saveFile != "" && !errors.Is(err, errCheckpoint) {
-			if saveErr := saveSession(saveFile, sess); saveErr != nil {
+		if sess.saveFile != "" && !errors.Is(err, errCheckpoint) {
+			if saveErr := saveSession(sess.saveFile, sess); saveErr != nil {
 				err = errors.Join(err, fmt.Errorf("%w: %w", errCheckpoint, saveErr))
 			}
 		}
@@ -262,7 +270,7 @@ func run(args []string) (status int) {
 		handled := false
 		var commandErr error
 		if !literal {
-			handled, commandErr = handleCommand(command, &sess, saveFile)
+			handled, commandErr = handleCommand(command, &sess, sess.saveFile)
 		}
 		if commandErr != nil {
 			infof("Save failed: %v\n", commandErr)
@@ -344,7 +352,8 @@ func handleCommand(input string, sess **Session, saveFile string) (bool, error) 
 			if err := saveSession(arg, *sess); err != nil {
 				return true, fmt.Errorf("%w: %w", errCheckpoint, err)
 			}
-			put("Session saved.\n")
+			put("Session checkpoints enabled.\n")
+			infof("%s\n", (*sess).persistenceNotice())
 			break
 		}
 		loaded, err := loadReservedSession(arg, (*sess).owner)
@@ -352,13 +361,21 @@ func handleCommand(input string, sess **Session, saveFile string) (bool, error) 
 			putf("Reload failed: %v (session must be nonempty)\n", err)
 			break
 		}
-		loaded.owner = (*sess).owner
-		(*sess).close()
+		old := *sess
+		if old.owner.matches(arg) {
+			loaded.owner, loaded.ownsOwner = old.owner, old.ownsOwner
+			loaded.saveFile = old.saveFile
+			old.owner, old.ownsOwner = nil, false
+		} else if old.owner != nil {
+			old.owner.close()
+			old.owner, old.ownsOwner = nil, false
+		}
+		old.close()
 		*sess = loaded
-		loaded.saveFile = saveFile
 		clearPending()
 		showSystemPrompt(loaded.Transcript)
 		put("Session reloaded.\n")
+		infof("%s\n", loaded.persistenceNotice())
 	default:
 		return false, nil
 	}
