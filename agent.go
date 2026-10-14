@@ -593,7 +593,14 @@ func recordTurnAbort(sess *Session, content, marker string) {
 
 var errCheckpoint = errors.New("checkpoint failed")
 
+// maxBadRounds bounds consecutive retryable aborts inside one inference turn.
+// Each retry feeds the model its own abort marker, so it can correct a
+// malformed tool call or resume a severed stream; a model that keeps failing
+// ends the turn with the original error instead of looping forever.
+const maxBadRounds = 5
+
 func runInferenceLoop(ctx context.Context, sess *Session) error {
+	badRounds := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -646,11 +653,24 @@ func runInferenceLoop(ctx context.Context, sess *Session) error {
 				marker = interruptedMarker
 			}
 			recordTurnAbort(sess, content.String(), marker)
+			if badRounds < maxBadRounds && errors.Is(streamErr, errRoundRetry) {
+				// A malformed tool call or a severed stream must not
+				// end the run: nothing was executed, and the abort
+				// marker above tells the model what went wrong.
+				badRounds++
+				continue
+			}
 			return streamErr
 		}
 		if len(calls) == 0 {
 			if content.Len() == 0 {
-				return errors.New("API returned no assistant content or tool calls")
+				err := retryRound(errors.New("API returned no assistant content or tool calls"))
+				if badRounds < maxBadRounds {
+					badRounds++
+					recordTurnAbort(sess, "", fmt.Sprintf("[Turn aborted: %v]", err))
+					continue
+				}
+				return err
 			}
 			sess.Transcript = append(sess.Transcript, Message{Role: "assistant", Content: content.String()})
 			if err := putContext(ctx, "\n"); err != nil {
@@ -683,6 +703,7 @@ func runInferenceLoop(ctx context.Context, sess *Session) error {
 			}
 		}
 		sess.Transcript = append(sess.Transcript, results...)
+		badRounds = 0 // a completed tool round is progress
 		if sess.saveFile != "" {
 			if err := checkpointSession(sess.saveFile, sess); err != nil {
 				return fmt.Errorf("%w: %w", errCheckpoint, err)
@@ -704,7 +725,7 @@ func systemRules() string {
 		"Use memory_edit after milestones or large outputs. Replace all notes; retain goals, constraints, facts, evidence, files and unfinished work. It releases completed history from RAM and context. Unsaved originals are lost; only continue mode saves ongoing history. " +
 		"Use history_read with absolute [start,end) indices to recall the selected archive. history_next is its exclusive upper bound; read [0,0) to discover archive bounds. No archive means no recovery of discarded originals. " +
 		"last_request_bytes measures JSON bytes, not tokens or capacity. " +
-		strconv.Quote(interruptedMarker) + " and [Turn aborted: ...] mark partial execution; check effects before retrying. Be concise."
+		strconv.Quote(interruptedMarker) + " and [Turn aborted: ...] mark partial execution; an aborted round executed no tool calls, so re-issue them correctly. Check effects before retrying earlier work. Be concise."
 }
 
 func showSystemPrompt(messages []Message) {

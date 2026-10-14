@@ -279,7 +279,10 @@ func TestSaveSessionAppendsCheckpoints(t *testing.T) {
 	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
-	s.Memory = "two"
+	// Memory replacements go through memory_edit so the document records them.
+	if result := s.editMemory("two", 0); strings.HasPrefix(result, "Error") {
+		t.Fatal(result)
+	}
 	s.Transcript = append(s.Transcript, Message{Role: "assistant", Content: "new evidence"})
 	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
@@ -289,7 +292,7 @@ func TestSaveSessionAppendsCheckpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(got.close)
-	if got.Memory != "two" || got.messageCount() != len(s.Transcript) {
+	if got.Memory != "two" || got.messageCount() != s.messageCount() {
 		t.Fatalf("checkpoint lost new memory or messages: %+v", got)
 	}
 	leftovers, _ := filepath.Glob(filepath.Join(dir, "*.tmp"))

@@ -27,6 +27,30 @@ var (
 	apiKey    string
 	modelName string
 
+	// errRoundRetry marks failures caused by the model's own output or a
+	// severed stream: the round produced no executable tool calls, so the
+	// inference loop can safely re-ask the model with the abort marker as
+	// feedback instead of terminating the process. Authentication errors,
+	// request rejections and caller cancellation stay fatal.
+	errRoundRetry = errors.New("inference round retry")
+)
+
+// retryRound preserves the cause's message (the model reads it inside turn
+// abort markers) while tagging the error for errors.Is(err, errRoundRetry).
+type retryRoundError struct{ cause error }
+
+func (e retryRoundError) Error() string      { return e.cause.Error() }
+func (e retryRoundError) Unwrap() error      { return e.cause }
+func (retryRoundError) Is(target error) bool { return target == errRoundRetry }
+
+func retryRound(cause error) error {
+	if cause == nil || errors.Is(cause, errRoundRetry) {
+		return cause
+	}
+	return retryRoundError{cause: cause}
+}
+
+var (
 	// Delta field names for providers deviating from the OpenAI defaults
 	// (e.g. DeepSeek-R1 style reasoning streams).
 	reasoningField    string
@@ -148,7 +172,7 @@ func (d *streamDeadline) expire() {
 		return
 	}
 	d.active = false
-	d.cancel(fmt.Errorf("stream idle timeout after %s: %w", d.timeout, context.DeadlineExceeded))
+	d.cancel(retryRound(fmt.Errorf("stream idle timeout after %s: %w", d.timeout, context.DeadlineExceeded)))
 }
 
 func (d *streamDeadline) disarm() {
@@ -344,11 +368,11 @@ func readSSE(r io.Reader, handle func(string) (bool, error)) error {
 		b, err := reader.ReadByte()
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				return fmt.Errorf("stream read error: %w", err)
+				return retryRound(fmt.Errorf("stream read error: %w", err))
 			}
 			// EOF is not a completion marker. Do not dispatch an unterminated
 			// event or execute tool calls from a severed response.
-			return fmt.Errorf("stream ended before completion: %w", io.ErrUnexpectedEOF)
+			return retryRound(fmt.Errorf("stream ended before completion: %w", io.ErrUnexpectedEOF))
 		}
 		if skipLF {
 			skipLF = false
@@ -387,19 +411,19 @@ func consumeChatStream(r io.Reader, send func(StreamEvent) error) error {
 		for _, index := range indices {
 			tool := tools[index]
 			if tool.id == "" || tool.name.Len() == 0 {
-				return fmt.Errorf("incomplete tool call at index %d: missing ID or function name", index)
+				return retryRound(fmt.Errorf("incomplete tool call at index %d: missing ID or function name", index))
 			}
 			if ids[tool.id] {
-				return fmt.Errorf("duplicate tool call ID %q", tool.id)
+				return retryRound(fmt.Errorf("duplicate tool call ID %q", tool.id))
 			}
 			ids[tool.id] = true
 			if tool.kind != "" && tool.kind != "function" {
-				return fmt.Errorf("unsupported tool call type %q", tool.kind)
+				return retryRound(fmt.Errorf("unsupported tool call type %q", tool.kind))
 			}
 			args := tool.args.String()
 			var object map[string]json.RawMessage
 			if err := json.Unmarshal([]byte(args), &object); err != nil || object == nil {
-				return fmt.Errorf("tool call %q has incomplete or non-object JSON arguments", tool.id)
+				return retryRound(fmt.Errorf("tool call %q has incomplete or non-object JSON arguments", tool.id))
 			}
 			calls = append(calls, ToolCall{ID: tool.id, Type: "function",
 				Function: FunctionCall{Name: tool.name.String(), Arguments: args}})
@@ -476,11 +500,11 @@ func consumeChatStream(r io.Reader, send func(StreamEvent) error) error {
 					} `json:"function"`
 				}
 				if err := json.Unmarshal(value, &fragments); err != nil {
-					return false, fmt.Errorf("invalid tool call delta: %w", err)
+					return false, retryRound(fmt.Errorf("invalid tool call delta: %w", err))
 				}
 				for _, fragment := range fragments {
 					if fragment.Index == nil || *fragment.Index < 0 {
-						return false, errors.New("tool call delta requires a nonnegative integer index")
+						return false, retryRound(errors.New("tool call delta requires a nonnegative integer index"))
 					}
 					index := *fragment.Index
 					tool := tools[index]
@@ -490,13 +514,13 @@ func consumeChatStream(r io.Reader, send func(StreamEvent) error) error {
 					}
 					if fragment.ID != "" {
 						if tool.id != "" && tool.id != fragment.ID {
-							return false, fmt.Errorf("tool call ID changed at index %d", index)
+							return false, retryRound(fmt.Errorf("tool call ID changed at index %d", index))
 						}
 						tool.id = fragment.ID
 					}
 					if fragment.Type != "" {
 						if tool.kind != "" && tool.kind != fragment.Type {
-							return false, fmt.Errorf("tool call type changed at index %d", index)
+							return false, retryRound(fmt.Errorf("tool call type changed at index %d", index))
 						}
 						tool.kind = fragment.Type
 					}
@@ -513,16 +537,16 @@ func consumeChatStream(r io.Reader, send func(StreamEvent) error) error {
 				case "":
 				case "stop":
 					if len(tools) > 0 {
-						return false, errors.New("stream stopped without completing tool calls")
+						return false, retryRound(errors.New("stream stopped without completing tool calls"))
 					}
 					return true, nil
 				case "tool_calls":
 					if len(tools) == 0 {
-						return false, errors.New("stream finished tool calls without any calls")
+						return false, retryRound(errors.New("stream finished tool calls without any calls"))
 					}
 					return true, finishTools()
 				default:
-					return false, fmt.Errorf("stream did not complete: finish_reason=%q", finish)
+					return false, retryRound(fmt.Errorf("stream did not complete: finish_reason=%q", finish))
 				}
 			}
 		}

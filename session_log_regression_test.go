@@ -58,17 +58,22 @@ func TestJournalRestartIgnoresUncommittedTailAndRepairsOnSave(t *testing.T) {
 	}
 	first, _ := regressionReadSavedState(t, s, path)
 	firstOffset := s.diskOffset
-	s.Memory = "Facts from the uncommitted second checkpoint."
 	s.Transcript = append(s.Transcript, Message{Role: "assistant", Content: "uncommitted result"})
-	if err := checkpointSession(path, s); err != nil {
-		t.Fatal(err)
+	if result := s.editMemory("Facts from the uncommitted second checkpoint.", 0); strings.HasPrefix(result, "Error") {
+		t.Fatal(result)
 	}
 	s.close()
 	complete, err := os.ReadFile(path)
 	if err != nil || len(complete) == 0 || complete[len(complete)-1] != '\n' {
 		t.Fatalf("missing checkpoint commit marker: %v", err)
 	}
-	interrupted := complete[:len(complete)-1]
+	// Tear the write in the middle of its first member: the message and the
+	// state it carried stay uncommitted together.
+	cut := bytes.Index(complete, []byte("\"m2\""))
+	if cut < 0 || int64(cut) < firstOffset || cut+6 > len(complete) {
+		t.Fatalf("cannot tear the document tail: %d; %d", cut, firstOffset)
+	}
+	interrupted := complete[:cut+6]
 	if err := os.WriteFile(path, interrupted, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -101,41 +106,9 @@ func TestJournalRestartIgnoresUncommittedTailAndRepairsOnSave(t *testing.T) {
 	}
 }
 
-func TestCommittedCheckpointChecksumCorruptionIsFatal(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "session.json")
-	s := newSession()
-	t.Cleanup(s.close)
-	s.Transcript = append(s.Transcript, Message{Role: "user", Content: "initial objective"})
-	if err := checkpointSession(path, s); err != nil {
-		t.Fatal(err)
-	}
-	s.Transcript = append(s.Transcript, Message{Role: "assistant", Content: "committed evidence"})
-	if err := checkpointSession(path, s); err != nil {
-		t.Fatal(err)
-	}
-	s.close()
-	contents, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	corrupt := bytes.Replace(contents, []byte("committed evidence"), []byte("corrupted evidence"), 1)
-	if bytes.Equal(corrupt, contents) {
-		t.Fatal("test did not modify a committed payload")
-	}
-	if err := os.WriteFile(path, corrupt, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if loaded, err := loadSession(path); err == nil || loaded != nil || !strings.Contains(err.Error(), "checksum") {
-		if loaded != nil {
-			loaded.close()
-		}
-		t.Fatalf("committed corruption was accepted: session=%v; error=%v", loaded, err)
-	}
-	after, err := os.ReadFile(path)
-	if err != nil || !bytes.Equal(after, corrupt) {
-		t.Fatalf("rejected corruption modified its source: %v", err)
-	}
-}
+// Per-record checksums were removed in v5: a torn write is caught by the
+// unterminated member, and same-length payload edits are accepted as a
+// deliberate trade-off.
 
 func TestSaveAsPreservesCompactedHistoryAndSource(t *testing.T) {
 	dir := t.TempDir()
@@ -187,8 +160,8 @@ func TestSaveAsPreservesCompactedHistoryAndSource(t *testing.T) {
 		t.Fatalf("save-as altered the original session: %v", err)
 	}
 	copied, err := os.ReadFile(copyPath)
-	if err != nil || !bytes.HasPrefix(copied, before) {
-		t.Fatalf("save-as rewrote the original journal bytes: %v", err)
+	if err != nil || !bytes.HasPrefix(copied, before[:len(before)-3]) || !bytes.HasSuffix(copied, []byte("}\n")) {
+		t.Fatalf("save-as rewrote the original document bytes: %v", err)
 	}
 	messages, state := regressionReadSavedState(t, nil, copyPath)
 	if !reflect.DeepEqual(messages, want) || state.Count != len(want) || state.Cursor != 4 || state.Base != 0 {
@@ -270,8 +243,10 @@ func TestCheckpointWriteFailureLeavesOldJournalReadable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	checkpoint := sessionCheckpoint{Version: sessionVersion, Base: state.Base, Start: state.Count, Messages: []Message{{Role: "assistant", Content: "must never become visible"}}, Memory: state.Memory, Cursor: state.Cursor}
-	if offset, err := appendSessionCheckpoint(readonly, state.Offset, checkpoint); err == nil || offset != state.Offset {
+	update := sessionUpdate{OpenDoc: state.DocOpen, Messages: []sessionMessage{
+		{Index: state.Count, Message: Message{Role: "assistant", Content: "must never become visible"}},
+	}}
+	if offset, err := writeSessionUpdate(readonly, state.Offset, update); err == nil || offset != state.Offset {
 		t.Fatalf("read-only write succeeded or changed commit offset: %d; %v", offset, err)
 	}
 	readonly.Close()

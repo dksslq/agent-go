@@ -1,22 +1,31 @@
 package main
 
-// The selected session file is its own journal. Complete, checked records are
-// appended and synced before absorbed messages leave memory; no spool or
-// replacement file is needed.
+// The selected session file is its own journal, stored as one JSON document.
+// Messages are object members keyed by their absolute transcript index
+// ("m13"), and a "state" member (base, cursor, memory) marks compaction
+// points. Appends extend the document in place: the writer truncates the
+// closing brace, appends the new members, and re-closes the document before
+// syncing. No per-record checksums: a torn write simply leaves an
+// unterminated member, and the streaming reader stops at the last complete
+// member. Old v4 journals and legacy arrays/objects still load; continuing
+// one appends a v5 document after the old bytes.
 
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 )
 
+const legacyJournalVersion = 4
+
+// sessionCheckpoint is the record format of v4 journals; the writer now
+// produces v5 documents, but old files still load.
 type sessionCheckpoint struct {
 	Version  int       `json:"version"`
 	Base     int       `json:"base,omitempty"`
@@ -31,6 +40,21 @@ type sessionLogEnvelope struct {
 	SHA256     string          `json:"sha256"`
 }
 
+// sessionState is the compaction state recorded in the document. Members
+// after a state member are committed; base is constant for the life of a
+// file, so repeated state members (memory_edit) carry the same base and the
+// last one wins.
+type sessionState struct {
+	Base   int    `json:"base"`
+	Cursor int    `json:"cursor"`
+	Memory string `json:"memory"`
+}
+
+type sessionMessage struct {
+	Index   int
+	Message Message
+}
+
 type sessionLogState struct {
 	Version int
 	Base    int
@@ -38,6 +62,7 @@ type sessionLogState struct {
 	Cursor  int
 	Memory  string
 	Offset  int64
+	DocOpen bool // a v5 document with committed members ends at Offset
 }
 
 // A section reader fixes this pass to the size observed at entry. The caller
@@ -80,13 +105,14 @@ func readSessionLog(f *os.File, visit func(int, Message) error) (sessionLogState
 		}
 		// An interrupted first journal record has no committed state yet.
 		reader = bufio.NewReader(io.NewSectionReader(f, start, size-start))
-		return readCheckpointLines(reader, start, state, visit)
+		return readCheckpointLines(f, reader, start, size, state, visit)
 	}
 	if first != json.Delim('[') && first != json.Delim('{') {
 		return state, errors.New("session must be an object or legacy array")
 	}
 	legacy := first == json.Delim('[')
 	var firstKey string
+	var preVersion *int
 	if first == json.Delim('{') {
 		if !decoder.More() {
 			return state, errors.New("session object is empty")
@@ -94,25 +120,217 @@ func readSessionLog(f *os.File, visit func(int, Message) error) (sessionLogState
 		key, err := decoder.Token()
 		if err != nil {
 			reader = bufio.NewReader(io.NewSectionReader(f, start, size-start))
-			return readCheckpointLines(reader, start, state, visit)
+			return readCheckpointLines(f, reader, start, size, state, visit)
 		}
 		firstKey, _ = key.(string)
-		legacy = firstKey != "checkpoint" && firstKey != "sha256"
+		legacy = firstKey != "checkpoint" && firstKey != "sha256" && firstKey != "version"
+		if firstKey == "version" {
+			value, verr := decoder.Token()
+			if verr == nil {
+				if number, ok := value.(float64); ok && number == float64(sessionVersion) {
+					// A v5 document: one JSON object with indexed messages.
+					return readSessionDoc(f, start, size, sessionLogState{}, visit)
+				}
+				if number, ok := value.(float64); ok {
+					version := int(number)
+					preVersion = &version
+				}
+				// A non-v5 leading version belongs to a legacy object.
+				state, err = readLegacySession(decoder, first, firstKey, preVersion, visit)
+				if err != nil {
+					return state, fmt.Errorf("invalid session JSON: %w", err)
+				}
+				state.Offset = start + decoder.InputOffset()
+				reader = bufio.NewReader(io.NewSectionReader(f, state.Offset, size-state.Offset))
+				return readCheckpointLines(f, reader, state.Offset, size, state, visit)
+			}
+			// Torn after "version": fall through and treat as journal lines.
+			legacy = false
+		}
 	}
 	if legacy {
-		state, err = readLegacySession(decoder, first, firstKey, visit)
+		state, err = readLegacySession(decoder, first, firstKey, preVersion, visit)
 		if err != nil {
 			return state, fmt.Errorf("invalid session JSON: %w", err)
 		}
 		state.Offset = start + decoder.InputOffset()
 		reader = bufio.NewReader(io.NewSectionReader(f, state.Offset, size-state.Offset))
-		return readCheckpointLines(reader, state.Offset, state, visit)
+		return readCheckpointLines(f, reader, state.Offset, size, state, visit)
 	}
 	reader = bufio.NewReader(io.NewSectionReader(f, start, size-start))
-	return readCheckpointLines(reader, start, state, visit)
+	return readCheckpointLines(f, reader, start, size, state, visit)
 }
 
-func readCheckpointLines(reader *bufio.Reader, offset int64, state sessionLogState, visit func(int, Message) error) (sessionLogState, error) {
+// docReadErr classifies a decode failure: end-of-input means the write was
+// torn and everything decoded so far is committed; anything else is real
+// corruption and stays fatal.
+func docReadErr(err error) error {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return nil
+	}
+	return err
+}
+
+// readSessionDoc streams one v5 document starting at start. prefix carries
+// the state of a preceding v4 journal or legacy object; when the document is
+// a continuation (prefix.Count > 0) its first message key must continue that
+// count and its state must keep the same base.
+func readSessionDoc(f *os.File, start, size int64, prefix sessionLogState, visit func(int, Message) error) (sessionLogState, error) {
+	state := prefix
+	state.Version = sessionVersion
+	fresh := prefix.Count == 0
+	d := json.NewDecoder(io.NewSectionReader(f, start, size-start))
+	open, err := d.Token()
+	if err != nil {
+		if err := docReadErr(err); err != nil {
+			return state, fmt.Errorf("invalid session document: %w", err)
+		}
+		state.DocOpen = false
+		state.Offset = start
+		return state, nil
+	}
+	if open != json.Delim('{') {
+		return state, errors.New("invalid session document")
+	}
+	v := transcriptValidator{count: 1}
+	if fresh {
+		v.count = 0
+	}
+	base, baseKnown := prefix.Base, !fresh
+	members, lastKey := 0, -1
+	seenVersion, seenState := false, false
+	var memberEnd int64
+	for d.More() {
+		keyToken, err := d.Token()
+		if err != nil {
+			if err := docReadErr(err); err != nil {
+				return state, fmt.Errorf("invalid session document: %w", err)
+			}
+			break
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return state, errors.New("invalid session document field")
+		}
+		switch {
+		case key == "version":
+			if seenVersion || members != 0 || seenState {
+				return state, errors.New("version must be the first document field")
+			}
+			var version float64
+			if err := d.Decode(&version); err != nil {
+				if err := docReadErr(err); err != nil {
+					return state, fmt.Errorf("invalid session document version: %w", err)
+				}
+				break
+			}
+			if version != float64(sessionVersion) {
+				return state, fmt.Errorf("unsupported session document version %d", int(version))
+			}
+			seenVersion = true
+		case key == "state":
+			var st sessionState
+			if err := d.Decode(&st); err != nil {
+				if err := docReadErr(err); err != nil {
+					return state, fmt.Errorf("invalid session state: %w", err)
+				}
+				break
+			}
+			count := prefix.Count
+			if lastKey >= 0 {
+				count = lastKey + 1
+			}
+			if st.Base < 0 || st.Cursor <= st.Base || st.Cursor > count {
+				return state, errors.New("session state cursor outside its history")
+			}
+			if (st.Base > 0 || st.Cursor > st.Base+1) && strings.TrimSpace(st.Memory) == "" {
+				return state, errors.New("compacted session requires semantic memory")
+			}
+			if baseKnown && st.Base != base {
+				return state, errors.New("session state base does not match the document")
+			}
+			base, baseKnown = st.Base, true
+			state.Base, state.Cursor, state.Memory = st.Base, st.Cursor, st.Memory
+			seenState = true
+			memberEnd = d.InputOffset()
+		case strings.HasPrefix(key, "m") && len(key) > 1:
+			index, err := strconv.Atoi(key[1:])
+			if err != nil || index < 0 {
+				return state, fmt.Errorf("invalid session document field %q", key)
+			}
+			if members == 0 {
+				if fresh && index != 0 {
+					return state, errors.New("session document must begin with the system message")
+				}
+				if !fresh && index != prefix.Count {
+					return state, errors.New("session document does not continue its predecessor")
+				}
+			} else if index != lastKey+1 {
+				if !(fresh && members == 1 && index > 1) {
+					return state, errors.New("session document message index is not contiguous")
+				}
+			}
+			if fresh && members == 1 {
+				// The member after m0 starts the retained suffix; its index
+				// reveals the compaction gap.
+				if baseKnown && index-1 != base {
+					return state, errors.New("session document gap does not match its base")
+				}
+				base, baseKnown = index-1, true
+			}
+			var m Message
+			if err := d.Decode(&m); err != nil {
+				if err := docReadErr(err); err != nil {
+					return state, fmt.Errorf("invalid session message: %w", err)
+				}
+				break
+			}
+			if err := v.add(m); err != nil {
+				return state, err
+			}
+			if visit != nil {
+				if err := visit(index, m); err != nil {
+					return state, err
+				}
+			}
+			lastKey = index
+			members++
+			memberEnd = d.InputOffset()
+		default:
+			return state, fmt.Errorf("unknown session document field %q", key)
+		}
+	}
+	if closing, err := d.Token(); err != nil {
+		if err := docReadErr(err); err != nil {
+			return state, fmt.Errorf("invalid session document: %w", err)
+		}
+	} else if closing != json.Delim('}') {
+		return state, errors.New("invalid session document")
+	} else if _, err := d.Token(); err == nil || !errors.Is(err, io.EOF) {
+		return state, errors.New("trailing data in session document")
+	}
+	if err := v.finish(); err != nil {
+		return state, err
+	}
+	if members > 0 {
+		state.Count = lastKey + 1
+		state.Base = base
+		state.Offset = start + memberEnd
+		state.DocOpen = true
+		if fresh && !seenState {
+			return state, errors.New("session document lacks its initial state")
+		}
+	} else if seenState {
+		state.Offset = start + memberEnd
+		state.DocOpen = true
+	} else {
+		state.Offset = start
+		state.DocOpen = false
+	}
+	return state, nil
+}
+
+func readCheckpointLines(f *os.File, reader *bufio.Reader, offset int64, size int64, state sessionLogState, visit func(int, Message) error) (sessionLogState, error) {
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err == io.EOF {
@@ -134,13 +352,19 @@ func readCheckpointLines(reader *bufio.Reader, offset int64, state sessionLogSta
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
+		if bytes.Equal(bytes.TrimSpace(line), []byte("{")) {
+			// A v5 document continues the journal here.
+			return readSessionDoc(f, offset-int64(len(line)), size, state, visit)
+		}
 		var envelope sessionLogEnvelope
 		fields, err := decodeSessionObject(line, func(key string, d *json.Decoder) error {
 			switch key {
 			case "checkpoint":
 				return d.Decode(&envelope.Checkpoint)
 			case "sha256":
-				return d.Decode(&envelope.SHA256)
+				// Accepted for old journals; deliberately not verified.
+				var ignored string
+				return d.Decode(&ignored)
 			default:
 				return fmt.Errorf("unknown journal field %q", key)
 			}
@@ -150,10 +374,6 @@ func readCheckpointLines(reader *bufio.Reader, offset int64, state sessionLogSta
 				err = errors.New("missing journal field")
 			}
 			return state, fmt.Errorf("invalid session checkpoint: %w", err)
-		}
-		digest := sha256.Sum256(envelope.Checkpoint)
-		if envelope.SHA256 != hex.EncodeToString(digest[:]) {
-			return state, errors.New("session checkpoint checksum mismatch")
 		}
 		checkpoint, err := decodeSessionCheckpoint(envelope.Checkpoint)
 		if err != nil {
@@ -247,7 +467,7 @@ func decodeSessionCheckpoint(data []byte) (sessionCheckpoint, error) {
 }
 
 func validateSessionCheckpoint(checkpoint sessionCheckpoint) (int, error) {
-	if checkpoint.Version != sessionVersion || checkpoint.Base < 0 || checkpoint.Start < 0 {
+	if checkpoint.Version != legacyJournalVersion || checkpoint.Base < 0 || checkpoint.Start < 0 {
 		return 0, errors.New("invalid checkpoint version or index")
 	}
 	count := checkpoint.Start
@@ -289,18 +509,31 @@ func validateSessionCheckpoint(checkpoint sessionCheckpoint) (int, error) {
 	return count, nil
 }
 
-func appendSessionCheckpoint(f *os.File, offset int64, checkpoint sessionCheckpoint) (int64, error) {
-	if _, err := validateSessionCheckpoint(checkpoint); err != nil {
-		return offset, err
+// sessionUpdate describes one document append. OpenDoc continues the document
+// whose last committed member ends at offset; otherwise a new document is
+// opened at offset (after a legacy or v4 prefix, or at the start of a fresh
+// file). A nil State appends messages only.
+type sessionUpdate struct {
+	OpenDoc  bool
+	Messages []sessionMessage
+	State    *sessionState
+}
+
+// writeSessionUpdate appends members to the session document, then closes and
+// syncs it. It returns the offset of the end of the last member — the
+// position the next append or a recovery truncates back to. A failed write
+// rolls the file back to the incoming offset.
+func writeSessionUpdate(f *os.File, offset int64, update sessionUpdate) (int64, error) {
+	if len(update.Messages) == 0 && update.State == nil {
+		return offset, nil
 	}
-	body, err := json.Marshal(checkpoint)
-	if err != nil {
-		return offset, err
-	}
-	digest := sha256.Sum256(body)
-	data, err := json.Marshal(sessionLogEnvelope{Checkpoint: body, SHA256: hex.EncodeToString(digest[:])})
-	if err != nil {
-		return offset, err
+	var stateJSON []byte
+	if update.State != nil {
+		var err error
+		stateJSON, err = json.Marshal(*update.State)
+		if err != nil {
+			return offset, err
+		}
 	}
 	info, err := f.Stat()
 	if err != nil {
@@ -309,6 +542,41 @@ func appendSessionCheckpoint(f *os.File, offset int64, checkpoint sessionCheckpo
 	if !info.Mode().IsRegular() || offset < 0 || offset > info.Size() {
 		return offset, errors.New("invalid checkpoint file or offset")
 	}
+	separator := false
+	if !update.OpenDoc && offset > 0 {
+		// Keep the document's opening brace on its own line after a legacy
+		// object or journal record that lacks a trailing newline.
+		if _, err := f.Seek(offset-1, io.SeekStart); err != nil {
+			return offset, err
+		}
+		var previous [1]byte
+		if _, err := io.ReadFull(f, previous[:]); err != nil {
+			return offset, err
+		}
+		separator = previous[0] != '\n'
+	}
+	var tail bytes.Buffer
+	if !update.OpenDoc {
+		tail.WriteString("{\n  \"version\": ")
+		tail.WriteString(strconv.Itoa(sessionVersion))
+	}
+	// Every member supplies its own separator comma, for both the first
+	// member after "version" and appends to an open document.
+	for _, m := range update.Messages {
+		data, err := json.Marshal(m.Message)
+		if err != nil {
+			return offset, err
+		}
+		tail.WriteString(",\n  \"m")
+		tail.WriteString(strconv.Itoa(m.Index))
+		tail.WriteString("\": ")
+		tail.Write(data)
+	}
+	if update.State != nil {
+		tail.WriteString(",\n  \"state\": ")
+		tail.Write(stateJSON)
+	}
+	tail.WriteString("\n}\n")
 	rollback := func(cause error) (int64, error) {
 		truncateErr := f.Truncate(offset)
 		_, seekErr := f.Seek(offset, io.SeekStart)
@@ -324,23 +592,28 @@ func appendSessionCheckpoint(f *os.File, offset int64, checkpoint sessionCheckpo
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		return rollback(err)
 	}
-	// A separator also supports old snapshots that had no trailing newline.
-	if _, err := f.Write([]byte{'\n'}); err != nil {
+	if separator {
+		if _, err := f.Write([]byte{'\n'}); err != nil {
+			return rollback(err)
+		}
+	}
+	written := int64(0)
+	if separator {
+		written++
+	}
+	if _, err := f.Write(tail.Bytes()); err != nil {
 		return rollback(err)
 	}
-	if _, err := f.Write(data); err != nil {
-		return rollback(err)
-	}
-	if _, err := f.Write([]byte{'\n'}); err != nil {
-		return rollback(err)
-	}
+	written += int64(tail.Len())
 	if err := f.Sync(); err != nil {
 		return rollback(err)
 	}
-	return offset + int64(len(data)) + 2, nil
+	// The document closes with "\n}\n"; the next append resumes at the end
+	// of the last member, matching what a streaming read reports.
+	return offset + written - 3, nil
 }
 
-func readLegacySession(d *json.Decoder, first json.Token, firstKey string, visit func(int, Message) error) (sessionLogState, error) {
+func readLegacySession(d *json.Decoder, first json.Token, firstKey string, preVersion *int, visit func(int, Message) error) (sessionLogState, error) {
 	var state sessionLogState
 	v := transcriptValidator{}
 	readMessages := func() error {
@@ -378,7 +651,12 @@ func readLegacySession(d *json.Decoder, first json.Token, firstKey string, visit
 			var err error
 			switch key {
 			case "version":
-				err = d.Decode(&state.Version)
+				if preVersion != nil {
+					state.Version = *preVersion
+					preVersion = nil
+				} else {
+					err = d.Decode(&state.Version)
+				}
 			case "memory":
 				err = d.Decode(&state.Memory)
 			case "cursor":

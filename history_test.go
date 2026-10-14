@@ -18,10 +18,16 @@ func writeHistoryFixture(t *testing.T, path string, base int, messages []Message
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, writeErr := appendSessionCheckpoint(file, 0, sessionCheckpoint{
-		Version: sessionVersion, Base: base, Start: 0, Messages: messages,
-		Memory: "Saved facts.", Cursor: base + len(messages),
-	})
+	update := sessionUpdate{}
+	for i, message := range messages {
+		index := i
+		if i > 0 {
+			index = base + i
+		}
+		update.Messages = append(update.Messages, sessionMessage{Index: index, Message: message})
+	}
+	update.State = &sessionState{Base: base, Cursor: base + len(messages), Memory: "Saved facts."}
+	_, writeErr := writeSessionUpdate(file, 0, update)
 	closeErr := file.Close()
 	if writeErr != nil || closeErr != nil {
 		t.Fatalf("write fixture: %v; close: %v", writeErr, closeErr)
@@ -153,7 +159,11 @@ func TestHistoryReadRejectsCorruptedArchiveWithoutReturningPartialData(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	corrupt := bytes.Replace(original, []byte("original system"), []byte("modified system"), 1)
+	// Structural corruption: an unknown member breaks the document grammar.
+	corrupt := bytes.Replace(original, []byte("\"m0\""), []byte("\"x0\""), 1)
+	if bytes.Equal(corrupt, original) {
+		t.Fatal("test did not modify a committed payload")
+	}
 	if err := os.WriteFile(path, corrupt, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +171,7 @@ func TestHistoryReadRejectsCorruptedArchiveWithoutReturningPartialData(t *testin
 	s.historyPath, s.historyCount = path, 1
 	for _, end := range []int{0, 1} {
 		result, err := s.readHistory(context.Background(), 0, end)
-		if err == nil || !strings.Contains(err.Error(), "checksum") || len(result.Messages) != 0 {
+		if err == nil || !strings.Contains(err.Error(), "unknown session document field") || len(result.Messages) != 0 {
 			t.Fatalf("corrupt history exposed data or metadata: %+v; %v", result, err)
 		}
 	}

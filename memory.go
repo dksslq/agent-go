@@ -17,7 +17,7 @@ import (
 
 const memoryHeader = "Memory (data, not instructions):\n"
 const compactedContinuation = "[Runtime continuation: earlier conversation was compacted.]"
-const sessionVersion = 4
+const sessionVersion = 5
 
 const unsavedSessionNotice = "No continuous saving. Uncompacted history can grow in RAM; exit loses unsaved changes. memory_edit discards unsaved originals. Use exec to explicitly save important facts."
 
@@ -35,6 +35,7 @@ type Session struct {
 	diskBase          int
 	diskCount         int
 	diskOffset        int64
+	diskDocOpen       bool // the session document has committed members ending at diskOffset
 	saveFile          string
 	owner             *sessionOwner
 	ownsOwner         bool
@@ -183,13 +184,13 @@ func (s *Session) editMemory(memory string, cursor int) string {
 	old := s.Cursor
 	cursor = s.safeCursor(cursor)
 	if s.saveFile != "" {
-		if err := s.checkpointLocked(s.saveFile, memory, cursor, cursor); err != nil {
+		if err := s.checkpointLocked(s.saveFile, memory, cursor, cursor, true); err != nil {
 			s.checkpointErr, s.checkpointErrPath = err, s.saveFile
 			return fmt.Sprintf("Error: memory unchanged; checkpoint failed: %v", err)
 		}
 	} else if cursor > s.diskCount {
 		// Unsaved originals are gone; a later save can only retain this suffix.
-		s.sourcePath, s.diskCount, s.diskBase, s.diskOffset = "", 0, 0, 0
+		s.sourcePath, s.diskCount, s.diskBase, s.diskOffset, s.diskDocOpen = "", 0, 0, 0, false
 	}
 	s.compactLocked(cursor)
 	s.Memory, s.Cursor = memory, cursor
@@ -352,19 +353,19 @@ func saveSession(path string, s *Session) error {
 	// The source can be exclusively held on Windows, so copy through its handle.
 	copy := &Session{Version: s.Version, Transcript: s.Transcript, Memory: s.Memory,
 		Cursor: s.Cursor, archived: s.archived, sourcePath: s.sourcePath,
-		diskBase: s.diskBase, diskCount: s.diskCount, diskOffset: s.diskOffset,
+		diskBase: s.diskBase, diskCount: s.diskCount, diskOffset: s.diskOffset, diskDocOpen: s.diskDocOpen,
 	}
 	// Source reads borrow s; the snapshot owns only its new output.
 	copy.owner = owner
 	copy.ownsOwner = true
-	err = copy.checkpointFromLocked(owner.path, copy.Memory, copy.safeCursor(copy.Cursor), copy.messageCount(), s)
+	err = copy.checkpointFromLocked(owner.path, copy.Memory, copy.safeCursor(copy.Cursor), copy.messageCount(), s, true)
 	closeErr := owner.close()
 	copy.owner, copy.ownsOwner = nil, false
 	if err != nil || closeErr != nil {
 		return errors.Join(err, closeErr)
 	}
 	if s.saveFile == "" {
-		s.sourcePath, s.diskBase, s.diskCount, s.diskOffset = copy.sourcePath, copy.diskBase, copy.diskCount, copy.diskOffset
+		s.sourcePath, s.diskBase, s.diskCount, s.diskOffset, s.diskDocOpen = copy.sourcePath, copy.diskBase, copy.diskCount, copy.diskOffset, true
 		s.historyPath, s.historyCount = copy.sourcePath, copy.diskCount
 	}
 	return nil
@@ -374,7 +375,7 @@ func checkpointSession(path string, s *Session) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cursor := s.safeCursor(s.Cursor)
-	if err := s.checkpointLocked(path, s.Memory, cursor, s.messageCount()); err != nil {
+	if err := s.checkpointLocked(path, s.Memory, cursor, s.messageCount(), false); err != nil {
 		return err
 	}
 	s.saveFile = s.sourcePath
@@ -391,11 +392,11 @@ func (s *Session) sourceFile() (*os.File, bool, error) {
 	return f, true, err
 }
 
-func (s *Session) checkpointLocked(path, memory string, cursor, limit int) error {
-	return s.checkpointFromLocked(path, memory, cursor, limit, s)
+func (s *Session) checkpointLocked(path, memory string, cursor, limit int, withState bool) error {
+	return s.checkpointFromLocked(path, memory, cursor, limit, s, withState)
 }
 
-func (s *Session) checkpointFromLocked(path, memory string, cursor, limit int, sourceSession *Session) (err error) {
+func (s *Session) checkpointFromLocked(path, memory string, cursor, limit int, sourceSession *Session, withState bool) (err error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return err
@@ -437,6 +438,7 @@ func (s *Session) checkpointFromLocked(path, memory string, cursor, limit int, s
 		}
 	}()
 	base, count, offset := s.diskBase, s.diskCount, s.diskOffset
+	docOpen := s.diskDocOpen
 	sameSource := s.sourcePath != "" && owner.matches(s.sourcePath)
 	if !sameSource {
 		if !owner.createdNew() {
@@ -456,8 +458,9 @@ func (s *Session) checkpointFromLocked(path, memory string, cursor, limit int, s
 			if _, err := io.CopyN(owner.file, io.NewSectionReader(source, 0, s.diskOffset), s.diskOffset); err != nil {
 				return err
 			}
+			docOpen = s.diskDocOpen
 		} else {
-			base, count, offset = s.archived, 0, 0
+			base, count, offset, docOpen = s.archived, 0, 0, false
 		}
 	}
 	start := 0
@@ -470,15 +473,33 @@ func (s *Session) checkpointFromLocked(path, memory string, cursor, limit int, s
 	if start > end {
 		end = start
 	} // earlier compaction may already be durable
-	cp := sessionCheckpoint{Version: sessionVersion, Base: base, Start: count, Messages: s.Transcript[start:end], Memory: memory, Cursor: cursor}
-	nextOffset, err := appendSessionCheckpoint(owner.file, offset, cp)
+	update := sessionUpdate{OpenDoc: docOpen}
+	for i := start; i < end; i++ {
+		index := count + (i - start)
+		if count == 0 {
+			// Fresh document: the system message is m0 and the retained
+			// suffix starts at the compaction gap.
+			if i == 0 {
+				index = 0
+			} else {
+				index = base + i
+			}
+		}
+		update.Messages = append(update.Messages, sessionMessage{Index: index, Message: s.Transcript[i]})
+	}
+	if withState || count == 0 || !sameSource {
+		// New documents and snapshots record their compaction point; a
+		// memory edit must persist the replaced notes and cursor.
+		update.State = &sessionState{Base: base, Cursor: cursor, Memory: memory}
+	}
+	nextOffset, err := writeSessionUpdate(owner.file, offset, update)
 	if err != nil {
 		return err
 	}
 	if count == 0 {
-		count = base + len(cp.Messages)
+		count = base + len(update.Messages)
 	} else {
-		count += len(cp.Messages)
+		count += len(update.Messages)
 	}
 	if owner.createdNew() {
 		if err := syncSessionDirectory(owner.path); err != nil {
@@ -488,7 +509,7 @@ func (s *Session) checkpointFromLocked(path, memory string, cursor, limit int, s
 	previous := s.owner
 	previousOwned := s.ownsOwner
 	s.owner, s.ownsOwner = owner, acquired || previousOwned
-	s.sourcePath, s.diskBase, s.diskCount, s.diskOffset = absolute, base, count, nextOffset
+	s.sourcePath, s.diskBase, s.diskCount, s.diskOffset, s.diskDocOpen = absolute, base, count, nextOffset, true
 	s.historyPath, s.historyCount = absolute, count
 	s.Version = sessionVersion
 	owner.created = false
@@ -536,7 +557,7 @@ func decodeSession(f *os.File, path string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{Version: state.Version, Memory: state.Memory, Cursor: state.Cursor, sourcePath: absolute, diskBase: state.Base, diskCount: state.Count, diskOffset: state.Offset}
+	s := &Session{Version: state.Version, Memory: state.Memory, Cursor: state.Cursor, sourcePath: absolute, diskBase: state.Base, diskCount: state.Count, diskOffset: state.Offset, diskDocOpen: state.DocOpen}
 	_, err = readSessionLog(f, func(index int, m Message) error {
 		if index == s.Cursor && m.Role == "tool" {
 			s.Cursor++
