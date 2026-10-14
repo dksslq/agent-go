@@ -208,6 +208,35 @@ func TestCLI(t *testing.T) {
 			})
 		}
 	})
+	t.Run("save and continue reject directory aliases before work", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("creating symbolic links requires additional Windows privileges")
+		}
+		var requests atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			io.Copy(io.Discard, r.Body)
+			io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"must not run\"},\"finish_reason\":\"stop\"}]}\n\n")
+		}))
+		defer srv.Close()
+		dir := t.TempDir()
+		realDir, aliasDir := filepath.Join(dir, "real"), filepath.Join(dir, "alias")
+		if err := os.Mkdir(realDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(realDir, aliasDir); err != nil {
+			t.Fatal(err)
+		}
+		active, snapshot := filepath.Join(aliasDir, "session.json"), filepath.Join(realDir, "session.json")
+		cmd, _, errout := command(t, srv.URL, "-once", "-prompt", "must not run", "-continue", active, "-save", snapshot)
+		if code := exit(cmd.Run()); code != 1 || requests.Load() != 0 || !strings.Contains(errout.String(), "different file") {
+			t.Fatalf("status=%d requests=%d stderr=%q", code, requests.Load(), errout)
+		}
+		entries, err := os.ReadDir(realDir)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("aliased target conflict created files: files=%v error=%v", entries, err)
+		}
+	})
 	t.Run("save flag writes one snapshot at exit", func(t *testing.T) {
 		var requests atomic.Int32
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

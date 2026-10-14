@@ -58,10 +58,26 @@ func sameSessionPath(left, right string) bool {
 	if err != nil {
 		return false
 	}
-	if runtime.GOOS == "windows" {
-		return strings.EqualFold(a, b)
+	equal := func(a, b string) bool {
+		if runtime.GOOS == "windows" {
+			return strings.EqualFold(a, b)
+		}
+		return a == b
 	}
-	return a == b
+	if equal(a, b) {
+		return true
+	}
+	resolve := func(path string) string {
+		if resolved, err := filepath.EvalSymlinks(path); err == nil {
+			return resolved
+		}
+		// A new snapshot has no leaf yet; resolve its existing parent.
+		if parent, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+			return filepath.Join(parent, filepath.Base(path))
+		}
+		return path
+	}
+	return equal(resolve(a), resolve(b))
 }
 
 func (s *Session) messageCount() int { return s.archived + len(s.Transcript) }

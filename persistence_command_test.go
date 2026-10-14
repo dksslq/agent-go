@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -36,6 +37,30 @@ func assertSessionClosed(t *testing.T, path string) {
 	}
 	if err := owner.close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSessionPathResolvesDirectoryAliasesForNewFiles(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symbolic links requires additional Windows privileges")
+	}
+	dir := t.TempDir()
+	realDir, aliasDir := filepath.Join(dir, "real"), filepath.Join(dir, "alias")
+	if err := os.Mkdir(realDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Fatal(err)
+	}
+	realPath, aliasPath := filepath.Join(realDir, "new.json"), filepath.Join(aliasDir, "new.json")
+	if !sameSessionPath(realPath, aliasPath) || !sameSessionPath(aliasPath, realPath) {
+		t.Fatal("directory aliases identified a new session file as two different targets")
+	}
+	if sameSessionPath(realPath, filepath.Join(aliasDir, "different.json")) {
+		t.Fatal("directory alias normalization confused different session files")
+	}
+	if _, err := os.Lstat(realPath); !os.IsNotExist(err) {
+		t.Fatalf("comparing session paths created or opened a new file: %v", err)
 	}
 }
 
