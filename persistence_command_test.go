@@ -48,7 +48,9 @@ func TestDecodeSessionUsesGivenPathNotHandleName(t *testing.T) {
 	path := filepath.Join(dir, "session.json")
 	s := newSession()
 	s.Transcript = append(s.Transcript, Message{Role: "user", Content: "recorded"})
-	if err := checkpointSession(path, s); err != nil {
+	// A snapshot closes its owner before returning, so the file is reopenable
+	// even where that handle was exclusive (Windows).
+	if err := saveSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	f, err := os.Open(path)
