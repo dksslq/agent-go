@@ -35,16 +35,23 @@ func newOutputWriter(ctx context.Context, file *os.File) *outputWriter {
 	return w
 }
 
-func (w *outputWriter) write(text string) error {
+func (w *outputWriter) write(ctx context.Context, text string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	job := outputJob{text: text, done: make(chan error, 1)}
 	select {
 	case w.jobs <- job:
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-w.ctx.Done():
 		return w.ctx.Err()
 	}
 	select {
 	case err := <-job.done:
 		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-w.ctx.Done():
 		return w.ctx.Err()
 	}

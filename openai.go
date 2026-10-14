@@ -34,7 +34,7 @@ var (
 	toolCallsField    string
 	finishReasonField string
 
-	extraRequestFields []map[string]interface{}
+	extraRequestFields []map[string]json.RawMessage
 
 	httpMaxIdleConns  int
 	httpIdleTimeout   time.Duration
@@ -210,7 +210,7 @@ func chatStream(parent context.Context, messages []Message, report ...func(int))
 				case "model", "messages", "tools", "stream":
 					err = fmt.Errorf("-extra cannot override %q", key)
 				default:
-					raw[key], err = json.Marshal(value)
+					raw[key] = value
 				}
 				if err != nil {
 					break
@@ -502,11 +502,6 @@ func consumeChatStream(r io.Reader, send func(StreamEvent) error) error {
 					}
 					tool.name.WriteString(fragment.Function.Name)
 					tool.args.WriteString(fragment.Function.Arguments)
-				}
-				if len(fragments) > 0 {
-					if err := send(StreamEvent{Type: EventToolCallDelta}); err != nil {
-						return false, err
-					}
 				}
 			}
 			if value := fields[finishReasonField]; len(value) > 0 && string(value) != "null" {

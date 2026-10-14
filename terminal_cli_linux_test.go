@@ -11,6 +11,8 @@ import (
 	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -30,7 +32,7 @@ func TestCLIMultilinePaste(t *testing.T) {
 			return
 		}
 		requests <- q
-		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thought\",\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n")
 	}))
 	defer srv.Close()
 	master, slave := openPTY(t)
@@ -61,6 +63,7 @@ func TestCLIMultilinePaste(t *testing.T) {
 	prompts := make(chan struct{}, 8)
 	disabled := make(chan struct{}, 1)
 	readerDone := make(chan struct{})
+	var sawReasoning atomic.Bool
 	defer func() {
 		master.Close()
 		select {
@@ -82,6 +85,9 @@ func TestCLIMultilinePaste(t *testing.T) {
 			tail = append(tail, b)
 			if len(tail) > len(pasteStop) {
 				tail = tail[len(tail)-len(pasteStop):]
+			}
+			if strings.HasSuffix(string(tail), "thought") {
+				sawReasoning.Store(true)
 			}
 			if string(tail) == pasteStop {
 				disabled <- struct{}{}
@@ -128,6 +134,9 @@ func TestCLIMultilinePaste(t *testing.T) {
 	send("\r")
 	assertRequest(payload)
 	awaitPrompt()
+	if !sawReasoning.Load() {
+		t.Fatal("interactive reasoning hidden without -verbose")
+	}
 	send("/paste\r")
 	send("/save ignored\rquit\r\x04")
 	assertRequest("/save ignored\nquit\n")

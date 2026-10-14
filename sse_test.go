@@ -147,22 +147,18 @@ func TestChatStreamToolCallAccumulation(t *testing.T) {
 				toolCallChunk(t, 1, "a2", "image_read", `{"path":"x.png"}`)+
 				sseData("[DONE]"))
 	})
-	// out-of-order indices; stream ends without finish_reason -> flush at EOF.
+	// The explicit DONE marker completes accumulated calls without finish_reason.
 	evs, err := collectStream(t, []Message{{Role: "user", Content: "hi"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var calls []ToolCall
-	var sawDelta bool
 	for _, e := range evs {
-		switch e.Type {
-		case EventToolCallDelta:
-			sawDelta = true
-		case EventToolCalls:
+		if e.Type == EventToolCalls {
 			calls = e.ToolCalls
 		}
 	}
-	if !sawDelta || calls == nil {
+	if calls == nil {
 		t.Fatalf("missing tool events: %+v", evs)
 	}
 	if len(calls) != 2 || calls[0].ID != "a1" || calls[0].Function.Name != "exec" ||
@@ -341,7 +337,7 @@ func TestChatStreamRequestShape(t *testing.T) {
 			shape.Model, shape.Stream, len(shape.Messages), len(shape.Tools))
 	}
 
-	extraRequestFields = []map[string]interface{}{{"temperature": 0.5}}
+	extraRequestFields = []map[string]json.RawMessage{{"temperature": json.RawMessage(`0.5`)}}
 	if _, err := collectStream(t, msgs); err != nil {
 		t.Fatal(err)
 	}

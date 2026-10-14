@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -47,6 +48,32 @@ func TestCLI(t *testing.T) {
 		}
 		return -1
 	}
+	t.Run("extra preserves exact JSON numbers", func(t *testing.T) {
+		const extra = `{"seed":9007199254740993,"nested":{"id":9223372036854775807,"fraction":0.12345678901234567890123456789},"temperature":0.1}`
+		requests := make(chan map[string]json.RawMessage, 1)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Error(err)
+			}
+			requests <- body
+			io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n")
+		}))
+		defer srv.Close()
+		cmd, _, errout := command(t, srv.URL, "-once", "-prompt", "hello", "-extra", base64.StdEncoding.EncodeToString([]byte(extra)), "-extra", base64.StdEncoding.EncodeToString([]byte(`{"temperature":0.2}`)))
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("CLI: %v; %s", err, errout)
+		}
+		body := <-requests
+		var want map[string]json.RawMessage
+		json.Unmarshal([]byte(extra), &want)
+		want["temperature"] = json.RawMessage(`0.2`)
+		for key, value := range want {
+			if string(body[key]) != string(value) {
+				t.Fatalf("%s changed: got %s, want %s", key, body[key], value)
+			}
+		}
+	})
 	t.Run("API failure is failure", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			io.Copy(io.Discard, r.Body)
@@ -421,6 +448,88 @@ func TestCLI(t *testing.T) {
 		})
 		return
 	} // Windows console signals need a console.
+	t.Run("interactive cancellation checkpoints blocked output and recovers", func(t *testing.T) {
+		var requests atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			io.Copy(io.Discard, r.Body)
+			content := "recovered"
+			if requests.Add(1) == 1 {
+				content = strings.Repeat("x", 1024*1024)
+			}
+			body, _ := json.Marshal(map[string]interface{}{"choices": []interface{}{map[string]interface{}{"delta": map[string]interface{}{"content": content}, "finish_reason": "stop"}}})
+			io.WriteString(w, "data: "+string(body)+"\n\n")
+		}))
+		defer srv.Close()
+		path := filepath.Join(t.TempDir(), "session.json")
+		cmd, _, errout := command(t, srv.URL, "-prompt", "first", "-continue", path)
+		input, err := cmd.StdinPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer input.Close()
+		reader, writer, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reader.Close()
+		defer writer.Close()
+		cmd.Stdout = writer
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if cmd.ProcessState == nil {
+				cmd.Process.Kill()
+				cmd.Wait()
+			}
+		}()
+		var first [1]byte
+		if _, err := reader.Read(first[:]); err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Process.Signal(os.Interrupt); err != nil {
+			t.Fatal(err)
+		}
+		// Do not drain stdout yet: the interrupted turn must checkpoint anyway.
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			saved, err := loadSession(path)
+			aborted := false
+			if err == nil && saved != nil {
+				last := saved.Transcript[len(saved.Transcript)-1]
+				text, _ := last.Content.(string)
+				aborted = last.Role == "assistant" && strings.Contains(text, interruptedMarker)
+				saved.close()
+			}
+			if aborted {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("first SIGINT did not checkpoint the blocked turn")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		drained := make(chan struct{})
+		go func() { io.Copy(io.Discard, reader); close(drained) }()
+		io.WriteString(input, "second\nquit\n")
+		input.Close()
+		if err := cmd.Wait(); err != nil {
+			t.Fatalf("recovery: %v; %s", err, errout)
+		}
+		writer.Close()
+		<-drained
+		if requests.Load() != 2 {
+			t.Fatalf("requests=%d", requests.Load())
+		}
+		saved, err := loadSession(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer saved.close()
+		if got := saved.Transcript[len(saved.Transcript)-1].Content; got != "recovered" {
+			t.Fatalf("next turn failed: %v", got)
+		}
+	})
 	for _, sig := range []os.Signal{os.Interrupt, syscall.SIGTERM} {
 		t.Run("signal "+sig.String(), func(t *testing.T) {
 			ready := make(chan struct{}, 1)

@@ -664,3 +664,8 @@ func TestContextPrefixStable(t *testing.T) {
 		t.Fatal("view must be append-only again after the edit")
 	}
 }
+
+// Test convenience wrapper; production uses execCmdOutput directly.
+func execCmd(ctx context.Context, program string, args []string, input string, timeout time.Duration, maxChars int, cwd string, environ map[string]string, detach bool) string {
+	return execCmdOutput(ctx, program, args, input, timeout, maxChars, cwd, environ, detach, "")
+}

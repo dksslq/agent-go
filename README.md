@@ -45,7 +45,7 @@ export AGENT_API_BASE='http://localhost:8080/v1'
 
 `-once` 要求提供非空 `-prompt`。`-pipe` 读取 stdin 至 EOF，将它与可选的 `-prompt` 用空行连接，原样保留 stdin 的空白与文本，并隐含 `-once`。这两种模式不切换终端状态，也不打印交互提示符。
 
-stdout 输出流式助手正文，包括工具执行前的说明；工具状态与错误走 stderr。默认日志只展示工具名称，`-verbose` 才展示推理内容、工具参数与结果。这些详细日志可能包含任务数据，请按需要开启。
+stdout 输出流式助手正文，包括工具执行前的说明；工具状态与错误走 stderr。交互终端保持显示推理内容；非交互运行仅在 `-verbose` 时输出推理内容到 stderr。工具日志默认只展示名称，`-verbose` 才展示工具参数与结果。这些详细日志可能包含任务数据，请按需要开启。
 
 | 退出码 | 含义 |
 |---|---|
@@ -180,7 +180,7 @@ CI 在 Linux 的 Go 1.21 与 stable、macOS stable、Windows stable 上运行检
 
 代码按职责拆分：`cli.go` 处理入口与信号，`agent.go` 处理推理与工具，`openai.go` 处理 API / SSE，`memory.go` 处理会话与增量日志，`exec_output.go` 处理输出捕获，`output.go` 处理可取消的标准输出，`exec_*.go` / `term_*.go` / `session_*.go` 提供平台适配。它们构建为同一个可执行文件。
 
-历史变更见 [CHANGES.md](CHANGES.md)。本次协议修复与保存语义见 [v2.4.0](docs/release-v2.4.0.md)；此前的运行时、终端、工具输出与持久化审计分别见 [v2.1.0](docs/release-v2.1.0.md)、[v2.1.1](docs/release-v2.1.1.md)、[v2.1.2](docs/release-v2.1.2.md)、[v2.1.3](docs/release-v2.1.3.md)、[v2.2.0](docs/release-v2.2.0.md)、[v2.3.0](docs/release-v2.3.0.md)。
+历史变更见 [CHANGES.md](CHANGES.md)。轮次取消与参数保真修复见 [v2.4.2](docs/release-v2.4.2.md)。本次协议修复与保存语义见 [v2.4.0](docs/release-v2.4.0.md)；此前的运行时、终端、工具输出与持久化审计分别见 [v2.1.0](docs/release-v2.1.0.md)、[v2.1.1](docs/release-v2.1.1.md)、[v2.1.2](docs/release-v2.1.2.md)、[v2.1.3](docs/release-v2.1.3.md)、[v2.2.0](docs/release-v2.2.0.md)、[v2.3.0](docs/release-v2.3.0.md)。
 
 ## 许可与署名
 

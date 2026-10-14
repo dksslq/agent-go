@@ -254,12 +254,12 @@ func TestStreamCRCompletionDoesNotWaitForAnotherByte(t *testing.T) {
 func TestStreamRejectsReservedExtraFieldsAndInvalidRequestValues(t *testing.T) {
 	withStreamDefaults(t)
 	for _, key := range []string{"model", "messages", "tools", "stream"} {
-		extraRequestFields = []map[string]interface{}{{key: false}}
+		extraRequestFields = []map[string]json.RawMessage{{key: json.RawMessage(`false`)}}
 		if _, _, err := chatStream(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "cannot override") {
 			t.Fatalf("reserved extra field %q: %v", key, err)
 		}
 	}
-	extraRequestFields = []map[string]interface{}{{"temperature": 0.5}}
+	extraRequestFields = []map[string]json.RawMessage{{"temperature": json.RawMessage(`0.5`)}}
 	if _, _, err := chatStream(context.Background(), []Message{{Role: "user", Content: make(chan int)}}); err == nil {
 		t.Fatal("unsupported message content was silently lost when merging extras")
 	}
@@ -351,7 +351,7 @@ func TestStreamMarshalFailureDoesNotIssueRequest(t *testing.T) {
 		called = true
 		return nil, errors.New("unexpected request")
 	})}
-	extraRequestFields = []map[string]interface{}{{"bad": make(chan int)}}
+	extraRequestFields = []map[string]json.RawMessage{{"bad": json.RawMessage(`{`)}}
 	if _, _, err := chatStream(context.Background(), nil); err == nil || called {
 		t.Fatalf("failed marshal issued a request: called=%t err=%v", called, err)
 	}
@@ -359,7 +359,7 @@ func TestStreamMarshalFailureDoesNotIssueRequest(t *testing.T) {
 
 func TestStreamRequestSizeMatchesHTTPPayload(t *testing.T) {
 	withStreamDefaults(t)
-	extraRequestFields = []map[string]interface{}{{"temperature": 0.5, "provider_option": "追加\n字段"}}
+	extraRequestFields = []map[string]json.RawMessage{{"temperature": json.RawMessage(`0.5`), "provider_option": json.RawMessage(`"追加\n字段"`)}}
 	bodyCh := make(chan []byte, 1)
 	withSSEServer(t, func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)

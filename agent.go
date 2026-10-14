@@ -77,7 +77,6 @@ type StreamEventType int
 const (
 	EventReasoning StreamEventType = iota
 	EventToken
-	EventToolCallDelta
 	EventToolCalls
 	EventError
 )
@@ -192,10 +191,6 @@ func buildCmdEnv(baseEnv []string, environ map[string]string) []string {
 		envList = append(envList, k+"="+v)
 	}
 	return envList
-}
-
-func execCmd(ctx context.Context, program string, args []string, input string, timeout time.Duration, maxChars int, cwd string, environ map[string]string, detach bool) string {
-	return execCmdOutput(ctx, program, args, input, timeout, maxChars, cwd, environ, detach, "")
 }
 
 type execResult struct {
@@ -478,24 +473,34 @@ func runTool(ctx context.Context, sess *Session, name, args string) (string, *Me
 	return wrapResult(startTime, endTime, result), extraMsg
 }
 
-func putStr(s string) error {
+func putStr(ctx context.Context, s string) error {
 	if termRaw {
 		s = strings.ReplaceAll(s, "\r\n", "\n")
 		s = strings.ReplaceAll(s, "\n", "\r\n")
 	}
 	if stdoutWriter != nil {
-		return stdoutWriter.write(s)
+		return stdoutWriter.write(ctx, s)
 	}
 	_, err := os.Stdout.WriteString(s)
 	return err
 }
 
 func put(s string) {
+	_ = putContext(context.Background(), s)
+}
+
+func putContext(ctx context.Context, s string) error {
 	outputMu.Lock()
 	defer outputMu.Unlock()
 	if outputErr == nil {
-		outputErr = putStr(s)
+		err := putStr(ctx, s)
+		// A canceled turn must not poison output for the next turn.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		outputErr = err
 	}
+	return outputErr
 }
 
 func outputFailure() error {
@@ -512,16 +517,19 @@ func putf(format string, args ...interface{}) {
 // when stdin is not a terminal (piped / autonomous runs) it goes to stderr,
 // keeping stdout clean for model output only.
 func infof(format string, args ...interface{}) {
+	_ = infofContext(context.Background(), format, args...)
+}
+
+func infofContext(ctx context.Context, format string, args ...interface{}) error {
 	if termRaw {
-		putf(format, args...)
-		return
+		return putContext(ctx, fmt.Sprintf(format, args...))
 	}
 	text := fmt.Sprintf(format, args...)
 	if stderrWriter != nil {
-		stderrWriter.write(text)
-	} else {
-		os.Stderr.WriteString(text)
+		return stderrWriter.write(ctx, text)
 	}
+	_, err := os.Stderr.WriteString(text)
+	return err
 }
 
 func runToolsParallel(ctx context.Context, sess *Session, calls []ToolCall) []Message {
@@ -543,9 +551,9 @@ func runToolsParallel(ctx context.Context, sess *Session, calls []ToolCall) []Me
 			}()
 			text, extra = runTool(ctx, sess, call.Function.Name, call.Function.Arguments)
 		}()
-		infof("[tool: %s]\n", call.Function.Name)
+		_ = infofContext(ctx, "[tool: %s]\n", call.Function.Name)
 		if verbose {
-			infof("arguments: %s\nresult: %s\n", call.Function.Arguments, text)
+			_ = infofContext(ctx, "arguments: %s\nresult: %s\n", call.Function.Arguments, text)
 		}
 		out[i] = result{Message{Role: "tool", ToolCallID: call.ID, Name: call.Function.Name, Content: text}, extra}
 	}
@@ -608,12 +616,14 @@ func runInferenceLoop(ctx context.Context, sess *Session) error {
 				switch e.Type {
 				case EventReasoning:
 					if verbose || termRaw {
-						infof("%s", e.Text)
+						if err := infofContext(ctx, "%s", e.Text); err != nil {
+							streamErr = err
+							break loop
+						}
 					}
 				case EventToken:
 					content.WriteString(e.Text)
-					put(e.Text)
-					if err := outputFailure(); err != nil {
+					if err := putContext(ctx, e.Text); err != nil {
 						streamErr = fmt.Errorf("write stdout: %w", err)
 						break loop
 					}
@@ -643,8 +653,7 @@ func runInferenceLoop(ctx context.Context, sess *Session) error {
 				return errors.New("API returned no assistant content or tool calls")
 			}
 			sess.Transcript = append(sess.Transcript, Message{Role: "assistant", Content: content.String()})
-			put("\n")
-			if err := outputFailure(); err != nil {
+			if err := putContext(ctx, "\n"); err != nil {
 				return fmt.Errorf("write stdout: %w", err)
 			}
 			return nil

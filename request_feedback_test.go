@@ -14,7 +14,7 @@ import (
 
 func TestInferenceRequestFeedbackPreservesHistoryAndSystemPrefix(t *testing.T) {
 	withStreamDefaults(t)
-	extraRequestFields = []map[string]interface{}{{"temperature": 0.3}}
+	extraRequestFields = []map[string]json.RawMessage{{"temperature": json.RawMessage(`0.3`)}}
 	sess := newSession()
 	defer sess.close()
 	sess.Transcript = append(sess.Transcript,

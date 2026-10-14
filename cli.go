@@ -54,7 +54,7 @@ func run(args []string) (status int) {
 		if err != nil {
 			return fmt.Errorf("invalid base64 for -extra: %w", err)
 		}
-		var obj map[string]interface{}
+		var obj map[string]json.RawMessage
 		if err := json.Unmarshal(b, &obj); err != nil || obj == nil {
 			return errors.New("-extra must decode to a JSON object")
 		}
