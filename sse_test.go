@@ -336,7 +336,7 @@ func TestChatStreamRequestShape(t *testing.T) {
 	if _, err := collectStream(t, msgs); err != nil {
 		t.Fatal(err)
 	}
-	if shape.Model != "test-model" || !shape.Stream || len(shape.Messages) != 2 || len(shape.Tools) != 3 {
+	if shape.Model != "test-model" || !shape.Stream || len(shape.Messages) != 2 || len(shape.Tools) != 4 {
 		t.Fatalf("bad request shape: model=%q stream=%v msgs=%d tools=%d",
 			shape.Model, shape.Stream, len(shape.Messages), len(shape.Tools))
 	}
@@ -433,7 +433,7 @@ func TestMemoryEditEndToEnd(t *testing.T) {
 		},
 		Cursor: 1,
 	}
-	if err := saveSession(filepath.Join(t.TempDir(), "session.json"), sess); err != nil {
+	if err := checkpointSession(filepath.Join(t.TempDir(), "session.json"), sess); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(sess.close)

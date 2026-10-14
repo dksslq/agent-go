@@ -109,7 +109,7 @@ func TestExplicitSessionPersistsHistoryWithoutOtherFiles(t *testing.T) {
 		Message{Role: "assistant", ToolCalls: []ToolCall{regressionCall("exec", "exec")}},
 		Message{Role: "tool", ToolCallID: "exec", Name: "exec", Content: raw},
 	)
-	if err := saveSession(path, s); err != nil {
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	onlyExplicitFile(t, dir, "session.json")
@@ -119,7 +119,7 @@ func TestExplicitSessionPersistsHistoryWithoutOtherFiles(t *testing.T) {
 		t.Fatal(result)
 	}
 	s.Transcript = append(s.Transcript, Message{Role: "tool", ToolCallID: "edit", Name: "memory_edit", Content: result})
-	if err := saveSession(path, s); err != nil {
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	s.close()
@@ -158,7 +158,7 @@ func TestSavingAfterUnsavedCompactionPreservesOnlyRetainedHistory(t *testing.T) 
 	}
 	s.Transcript = append(s.Transcript, Message{Role: "user", Content: "continue with the retained facts"})
 	path := filepath.Join(dir, "session.json")
-	if err := saveSession(path, s); err != nil {
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	s.close()

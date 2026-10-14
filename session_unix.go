@@ -43,8 +43,7 @@ func (s *sessionOwner) matches(path string) bool {
 	if s == nil || s.file == nil || path == "" {
 		return false
 	}
-	absolute, err := filepath.Abs(path)
-	return err == nil && s.path == absolute
+	return sameSessionPath(s.path, path)
 }
 func (s *sessionOwner) createdNew() bool { return s != nil && s.file != nil && s.created }
 func (*sessionOwner) exclusive() bool    { return false }

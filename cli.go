@@ -33,8 +33,8 @@ func run(args []string) (status int) {
 	prompt := fs.String("prompt", "", "User prompt")
 	once := fs.Bool("once", false, "Process -prompt once and exit")
 	pipe := fs.Bool("pipe", false, "Read stdin as data; combine with -prompt; implies -once")
-	load := fs.String("load", "", "Load an existing session")
-	save := fs.String("save", "", "Checkpoint session after each tool round and turn")
+	load := fs.String("load", "", "Load a session without updating its file")
+	save := fs.String("save", "", "Save a snapshot to a new file on exit")
 	resume := fs.String("continue", "", "Load if present and checkpoint to the same file")
 	fs.BoolVar(&verbose, "verbose", false, "Show reasoning, tool arguments and tool results on stderr")
 	fs.StringVar(&apiBase, "api-base", envDefault("AGENT_API_BASE", "http://localhost:8080/v1"), "API base URL; default from AGENT_API_BASE")
@@ -81,6 +81,23 @@ func run(args []string) (status int) {
 		infof("Error: timeouts and idle connection count must be nonnegative\n")
 		return 1
 	}
+	if *load != "" && *resume != "" {
+		infof("Error: -load and -continue are mutually exclusive\n")
+		return 1
+	}
+	if sameSessionPath(*save, *resume) {
+		infof("Save failed: snapshot must use a different file from -continue\n")
+		return 1
+	}
+	if *save != "" {
+		if _, err := os.Lstat(*save); !errors.Is(err, os.ErrNotExist) {
+			if err == nil {
+				err = errors.New("path already exists")
+			}
+			infof("Save failed: snapshot requires a new file: %v\n", err)
+			return 1
+		}
+	}
 	ctx, shutdown := context.WithCancel(context.Background())
 	defer shutdown()
 	stdoutWriter = newOutputWriter(ctx, os.Stdout)
@@ -121,59 +138,24 @@ func run(args []string) (status int) {
 		}
 		return 0
 	}
-	loadFile, saveFile, strictLoad := *load, *save, *load != ""
+	sess := newSession()
 	if *resume != "" {
-		if loadFile == "" {
-			loadFile, strictLoad = *resume, false
-		}
-		if saveFile == "" {
-			saveFile = *resume
-		}
+		sess, err = continueSession(*resume)
+	} else if *load != "" {
+		sess, err = loadSession(*load)
 	}
-	// Open only the explicitly selected output before reading stdin or starting work.
-	owner, err := reserveSession(saveFile, true)
-	if err != nil {
-		infof("checkpoint failed: %v\n", err)
+	if err != nil || sess == nil {
+		infof("Error opening session: %v (session must be nonempty)\n", err)
 		return 1
 	}
 	defer func() {
-		if err := owner.close(); err != nil {
+		if err := sess.release(); err != nil {
 			infof("Session cleanup failed: %v\n", err)
 			if status == 0 {
 				status = 1
 			}
 		}
 	}()
-	sess := newSession()
-	defer func() { sess.close() }()
-	if loadFile != "" {
-		var loaded *Session
-		var err error
-		if owner.matches(loadFile) && owner.createdNew() {
-			err = os.ErrNotExist
-		} else {
-			loaded, err = loadReservedSession(loadFile, owner)
-		}
-		switch {
-		case err == nil && loaded != nil:
-			sess = loaded
-		case err == nil:
-			infof("Error loading session: existing session file is empty\n")
-			return 1
-		case errors.Is(err, os.ErrNotExist) && !strictLoad:
-		default:
-			infof("Error loading session: %v\n", err)
-			return 1
-		}
-	}
-	if owner != nil && !owner.createdNew() && !(loadFile != "" && owner.matches(loadFile)) {
-		infof("checkpoint failed: save path already exists; use -continue or load the same file\n")
-		return 1
-	}
-	sess.saveFile, sess.owner = saveFile, owner
-	if owner != nil {
-		sess.saveFile = owner.path
-	}
 	if *pipe {
 		p, err := readInput(ctx, func() (string, error) { return pipePrompt(*prompt, os.Stdin) })
 		if err != nil {
@@ -185,6 +167,16 @@ func run(args []string) (status int) {
 			return 1
 		}
 		*prompt, *once = p, true
+	}
+	if *save != "" {
+		defer func() {
+			if err := saveSession(*save, sess); err != nil {
+				infof("Save failed: %v\n", err)
+				if status == 0 {
+					status = 1
+				}
+			}
+		}()
 	}
 	httpClient = newHTTPClient()
 	defer httpClient.CloseIdleConnections()
@@ -217,7 +209,7 @@ func run(args []string) (status int) {
 			clearPending()
 		}
 		if sess.saveFile != "" && !errors.Is(err, errCheckpoint) {
-			if saveErr := saveSession(sess.saveFile, sess); saveErr != nil {
+			if saveErr := checkpointSession(sess.saveFile, sess); saveErr != nil {
 				err = errors.Join(err, fmt.Errorf("%w: %w", errCheckpoint, saveErr))
 			}
 		}
@@ -270,7 +262,7 @@ func run(args []string) (status int) {
 		handled := false
 		var commandErr error
 		if !literal {
-			handled, commandErr = handleCommand(command, &sess, sess.saveFile)
+			handled, commandErr = handleCommand(command, &sess)
 		}
 		if commandErr != nil {
 			infof("Save failed: %v\n", commandErr)
@@ -314,7 +306,7 @@ func readInput(ctx context.Context, read func() (string, error)) (string, error)
 	}
 }
 
-func handleCommand(input string, sess **Session, saveFile string) (bool, error) {
+func handleCommand(input string, sess **Session) (bool, error) {
 	cmd, arg, _ := strings.Cut(input, " ")
 	arg = strings.TrimSpace(arg)
 	switch cmd {
@@ -343,7 +335,7 @@ func handleCommand(input string, sess **Session, saveFile string) (bool, error) 
 		}
 		pending.images = append(pending.images, ContentBlock{Type: "image_url", ImageURL: &ImageURL{URL: uri, Detail: "auto"}})
 		putf("Image appended (%d pending).\n", len(pending.images))
-	case "/save", "/reload":
+	case "/save", "/load", "/reload", "/continue":
 		if arg == "" {
 			putf("Usage: %s <filename>\n", cmd)
 			break
@@ -352,29 +344,38 @@ func handleCommand(input string, sess **Session, saveFile string) (bool, error) 
 			if err := saveSession(arg, *sess); err != nil {
 				return true, fmt.Errorf("%w: %w", errCheckpoint, err)
 			}
-			put("Session checkpoints enabled.\n")
+			put("Session snapshot saved.\n")
 			infof("%s\n", (*sess).persistenceNotice())
 			break
 		}
-		loaded, err := loadReservedSession(arg, (*sess).owner)
+		old := *sess
+		var loaded *Session
+		var err error
+		if cmd == "/continue" && !old.owner.matches(arg) {
+			loaded, err = continueSession(arg)
+		} else {
+			loaded, err = loadReservedSession(arg, old.owner)
+		}
 		if err != nil || loaded == nil {
-			putf("Reload failed: %v (session must be nonempty)\n", err)
+			if cmd == "/continue" {
+				return true, fmt.Errorf("%w: cannot continue session: %v", errCheckpoint, err)
+			}
+			putf("Session unchanged: %v (session must be nonempty)\n", err)
 			break
 		}
-		old := *sess
-		if old.owner.matches(arg) {
+		if cmd == "/continue" && old.owner.matches(arg) {
 			loaded.owner, loaded.ownsOwner = old.owner, old.ownsOwner
 			loaded.saveFile = old.saveFile
 			old.owner, old.ownsOwner = nil, false
-		} else if old.owner != nil {
-			old.owner.close()
-			old.owner, old.ownsOwner = nil, false
 		}
-		old.close()
+		if err := old.release(); err != nil {
+			loaded.close()
+			return true, fmt.Errorf("%w: %w", errCheckpoint, err)
+		}
 		*sess = loaded
 		clearPending()
 		showSystemPrompt(loaded.Transcript)
-		put("Session reloaded.\n")
+		put("Session opened.\n")
 		infof("%s\n", loaded.persistenceNotice())
 	default:
 		return false, nil

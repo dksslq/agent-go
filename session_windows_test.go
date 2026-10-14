@@ -49,7 +49,7 @@ func TestWindowsSessionOwnership(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session.json")
 	initial := newSession()
 	initial.Transcript = append(initial.Transcript, Message{Role: "user", Content: "original objective"})
-	if err := saveSession(path, initial); err != nil {
+	if err := checkpointSession(path, initial); err != nil {
 		t.Fatal(err)
 	}
 	initial.close()
@@ -100,7 +100,7 @@ func TestWindowsSessionOwnership(t *testing.T) {
 	}
 	for i := 0; i < 20; i++ {
 		s.Transcript = append(s.Transcript, Message{Role: "assistant", Content: fmt.Sprintf("checkpoint %d", i)})
-		if err := saveSession(path, s); err != nil {
+		if err := checkpointSession(path, s); err != nil {
 			t.Fatalf("owned append checkpoint failed: %v", err)
 		}
 		loaded, err := loadReservedSession(path, owner)
@@ -160,7 +160,7 @@ func TestWindowsReservationRollbackAndCommit(t *testing.T) {
 	}
 	s := newSession()
 	s.owner = owner
-	if err := saveSession(committed, s); err != nil {
+	if err := checkpointSession(committed, s); err != nil {
 		owner.close()
 		t.Fatal(err)
 	}

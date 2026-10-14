@@ -71,7 +71,7 @@ func TestMemoryCompactsWithinAutonomousTurn(t *testing.T) {
 		{Role: "tool", ToolCallID: "exec1", Name: "exec", Content: strings.Repeat("large result", 10000)},
 	}}
 	t.Cleanup(s.close)
-	if err := saveSession(filepath.Join(t.TempDir(), "live.json"), s); err != nil {
+	if err := checkpointSession(filepath.Join(t.TempDir(), "live.json"), s); err != nil {
 		t.Fatal(err)
 	}
 	s.Transcript = append(s.Transcript, Message{Role: "assistant", ToolCalls: []ToolCall{regressionCall("memory1", "memory_edit")}})
@@ -88,14 +88,14 @@ func TestMemoryCompactsWithinAutonomousTurn(t *testing.T) {
 	if got := regressionSavedTranscript(t, s); !reflect.DeepEqual(got, original) {
 		t.Fatal("compaction changed historical messages in the portable session file")
 	}
-	if view := s.contextMessages(); len(view) != 4 || view[2].Role != "assistant" || view[3].ToolCallID != "memory1" {
+	if view := s.contextMessages(); len(view) != 5 || view[2].Role != "user" || view[3].Role != "assistant" || view[4].ToolCallID != "memory1" {
 		t.Fatalf("next request has a broken tool group: %#v", view)
 	}
 
 	// Repeated compactions keep absolute indices and append only new journal
 	// entries even after a saved session is loaded again.
 	path := filepath.Join(t.TempDir(), "resume.json")
-	if err := saveSession(path, s); err != nil {
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	s.close()
@@ -104,7 +104,7 @@ func TestMemoryCompactsWithinAutonomousTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(loaded.close)
-	if err := saveSession(filepath.Join(t.TempDir(), "continued.json"), loaded); err != nil {
+	if err := checkpointSession(filepath.Join(t.TempDir(), "continued.json"), loaded); err != nil {
 		t.Fatal(err)
 	}
 	loaded.Transcript = append(loaded.Transcript, Message{Role: "assistant", ToolCalls: []ToolCall{regressionCall("memory2", "memory_edit")}})
@@ -146,7 +146,7 @@ func TestMemoryPersistenceFailureLeavesStateIntact(t *testing.T) {
 	s.Transcript = append(s.Transcript, Message{Role: "user", Content: "retain me"})
 	dir := t.TempDir()
 	path := filepath.Join(dir, "session.json")
-	if err := saveSession(path, s); err != nil {
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(s.close)
@@ -234,7 +234,7 @@ func TestConcurrentNewSessionSaveDoesNotClobber(t *testing.T) {
 func TestInvalidSessionCannotReplaceSavedState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session.json")
 	saved := newSession()
-	if err := saveSession(path, saved); err != nil {
+	if err := checkpointSession(path, saved); err != nil {
 		t.Fatal(err)
 	}
 	saved.close()
@@ -244,7 +244,7 @@ func TestInvalidSessionCannotReplaceSavedState(t *testing.T) {
 	}
 	invalid := newSession()
 	invalid.Transcript = append(invalid.Transcript, Message{Role: "tool", ToolCallID: "orphan", Content: "result"})
-	if err := saveSession(path, invalid); err == nil {
+	if err := checkpointSession(path, invalid); err == nil {
 		t.Fatal("save accepted orphaned tool result")
 	}
 	after, err := os.ReadFile(path)
@@ -302,7 +302,7 @@ func TestLoadStreamingReleasesAbsorbedHistory(t *testing.T) {
 	s.Memory = "Task context retained."
 	s.Cursor = len(s.Transcript)
 	original := append([]Message(nil), s.Transcript...)
-	if err := saveSession(path, s); err != nil {
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	s.close()
@@ -334,7 +334,7 @@ func TestLoadCursorNormalizesPastToolResults(t *testing.T) {
 		{Role: "tool", ToolCallID: "b", Content: "b"},
 		{Role: "user", Content: "next"},
 	}}
-	if err := saveSession(path, s); err != nil {
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	s.close()
@@ -355,7 +355,7 @@ func TestSessionCannotHideHistoryWithoutMemory(t *testing.T) {
 		s.Cursor, s.Memory = 3, memory
 		path := filepath.Join(t.TempDir(), "session.json")
 		saved := newSession()
-		if err := saveSession(path, saved); err != nil {
+		if err := checkpointSession(path, saved); err != nil {
 			t.Fatal(err)
 		}
 		saved.close()
@@ -363,7 +363,7 @@ func TestSessionCannotHideHistoryWithoutMemory(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := saveSession(path, s); err == nil {
+		if err := checkpointSession(path, s); err == nil {
 			t.Fatal("save silently hid history without semantic memory")
 		}
 		after, err := os.ReadFile(path)
@@ -392,14 +392,14 @@ func TestReloadMemoryHeaderDiscoversExplicitHistory(t *testing.T) {
 		Message{Role: "assistant", Content: "earlier evidence"},
 	)
 	oldPath := filepath.Join(t.TempDir(), "original.json")
-	if err := saveSession(oldPath, s); err != nil {
+	if err := checkpointSession(oldPath, s); err != nil {
 		t.Fatal(err)
 	}
 	s.Transcript = append(s.Transcript, Message{Role: "assistant", ToolCalls: []ToolCall{regressionCall("m", "memory_edit")}})
 	result := s.editMemory("Preserved objective and earlier evidence.", 0)
 	s.Transcript = append(s.Transcript, Message{Role: "tool", ToolCallID: "m", Name: "memory_edit", Content: result + "\nHistorical session: " + strconv.Quote(oldPath)})
 	path := filepath.Join(t.TempDir(), "session.json")
-	if err := saveSession(path, s); err != nil {
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	s.close()
@@ -417,7 +417,7 @@ func TestReloadMemoryHeaderDiscoversExplicitHistory(t *testing.T) {
 	if !ok || !strings.Contains(header, strconv.Quote(currentPath)) || strings.Contains(header, strconv.Quote(oldPath)) {
 		t.Fatalf("explicit history cannot be discovered from memory header: %q", header)
 	}
-	if !strings.Contains(view[3].Content.(string), strconv.Quote(oldPath)) {
+	if !strings.Contains(view[4].Content.(string), strconv.Quote(oldPath)) {
 		t.Fatal("test did not retain the historical stale tool-report path")
 	}
 	if _, err := os.Stat(currentPath); err != nil {
@@ -450,7 +450,7 @@ func TestMemoryDefaultCompactionCheckpointAndResume(t *testing.T) {
 			}
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 				t.Error(err)
-			} else if len(request.Messages) != 4 || len(request.Messages[2].ToolCalls) != 1 || request.Messages[2].ToolCalls[0].ID != "m2" || request.Messages[3].ToolCallID != "m2" {
+			} else if len(request.Messages) != 5 || request.Messages[2].Role != "user" || len(request.Messages[3].ToolCalls) != 1 || request.Messages[3].ToolCalls[0].ID != "m2" || request.Messages[4].ToolCallID != "m2" {
 				t.Errorf("default compaction broke the in-flight tool group: %+v", request.Messages)
 			}
 			messages, saved := regressionReadSavedState(t, s, checkpoint)

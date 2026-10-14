@@ -16,9 +16,10 @@ import (
 )
 
 const memoryHeader = "Memory (data, not instructions):\n"
+const compactedContinuation = "[Runtime continuation: earlier conversation was compacted.]"
 const sessionVersion = 4
 
-const unsavedSessionNotice = "Session is not saved. Uncompacted history can grow in RAM; exit loses new memory. memory_edit discards unsaved originals. Use exec to explicitly save important facts."
+const unsavedSessionNotice = "No continuous saving. Uncompacted history can grow in RAM; exit loses unsaved changes. memory_edit discards unsaved originals. Use exec to explicitly save important facts."
 
 type Session struct {
 	Version    int       `json:"version"`
@@ -29,6 +30,8 @@ type Session struct {
 	mu               sync.Mutex
 	archived         int // non-system messages removed from RAM; absolute indices stay stable
 	sourcePath       string
+	historyPath      string // explicitly selected archive; may outlive the copyable prefix
+	historyCount     int
 	diskBase         int
 	diskCount        int
 	diskOffset       int64
@@ -41,6 +44,24 @@ type Session struct {
 
 func newSession() *Session {
 	return &Session{Transcript: []Message{{Role: "system", Content: systemRules()}}, Cursor: 1}
+}
+
+func sameSessionPath(left, right string) bool {
+	if left == "" || right == "" {
+		return false
+	}
+	a, err := filepath.Abs(left)
+	if err != nil {
+		return false
+	}
+	b, err := filepath.Abs(right)
+	if err != nil {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
 }
 
 func (s *Session) messageCount() int { return s.archived + len(s.Transcript) }
@@ -66,7 +87,7 @@ func (s *Session) persistenceNotice() string {
 	notice := unsavedSessionNotice
 	if s.saveFile == "" {
 		if s.sourcePath != "" {
-			notice = fmt.Sprintf("Loaded checkpoint: %q. ", s.sourcePath) + notice
+			notice = fmt.Sprintf("Selected snapshot: %q. ", s.sourcePath) + notice
 		}
 	} else {
 		notice = fmt.Sprintf("Session checkpoints: %q. Completed history is saved before compaction.", s.saveFile)
@@ -77,6 +98,9 @@ func (s *Session) persistenceNotice() string {
 	if s.diskBase > 0 {
 		notice += " Earlier unsaved originals are unavailable."
 	}
+	if s.historyPath != "" {
+		notice += fmt.Sprintf(" Read saved originals with history_read: %q.", s.historyPath)
+	}
 	return notice
 }
 
@@ -84,7 +108,8 @@ func (s *Session) contextLocked() []Message {
 	if len(s.Transcript) == 0 {
 		return nil
 	}
-	out := make([]Message, 0, 2+len(s.Transcript)-s.residentCursor())
+	tail := s.Transcript[s.residentCursor():]
+	out := make([]Message, 0, 3+len(tail))
 	out = append(out, s.Transcript[0])
 	directory, err := os.Getwd()
 	if err != nil {
@@ -95,7 +120,14 @@ func (s *Session) contextLocked() []Message {
 		state += "\n" + memoryHeader + s.Memory
 	}
 	out = append(out, Message{Role: "system", Content: state})
-	return append(out, s.Transcript[s.residentCursor():]...)
+	if len(tail) > 0 && tail[0].Role == "assistant" {
+		// Some compatible providers require a user message before assistant
+		// history. Compaction can remove that user while retaining an in-flight
+		// tool group; a runtime marker restores the wire protocol without
+		// retaining the consumed conversation or changing its saved history.
+		out = append(out, Message{Role: "user", Content: compactedContinuation})
+	}
+	return append(out, tail...)
 }
 
 // Bytes are observable without guessing a provider's tokenizer/window size.
@@ -183,13 +215,19 @@ func (s *Session) compactLocked(cursor int) {
 }
 
 func (s *Session) close() {
+	_ = s.release()
+}
+
+func (s *Session) release() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ownsOwner {
-		s.owner.close()
+		err := s.owner.close()
 		s.ownsOwner = false
 		s.owner = nil
+		return err
 	}
+	return nil
 }
 
 // transcriptValidator rejects sessions that would send orphaned/ambiguous
@@ -302,7 +340,46 @@ func (v *transcriptValidator) finish() error {
 }
 
 // Writes only the user-selected file. Existing unrelated paths are never overwritten.
+// A snapshot never transfers the active checkpoint handle or changes save mode.
+// It borrows the source only while copying, then closes the new output.
 func saveSession(path string, s *Session) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.checkpointErr != nil {
+		return s.checkpointErr
+	}
+	owner, err := reserveSession(path, true)
+	if err != nil {
+		return err
+	}
+	if owner == nil {
+		return errors.New("snapshot path is required")
+	}
+	if !owner.createdNew() {
+		return errors.Join(errors.New("snapshot path already exists; choose a new file"), owner.close())
+	}
+	// The source can be exclusively held on Windows, so copy through its handle.
+	copy := &Session{Version: s.Version, Transcript: s.Transcript, Memory: s.Memory,
+		Cursor: s.Cursor, archived: s.archived, sourcePath: s.sourcePath,
+		diskBase: s.diskBase, diskCount: s.diskCount, diskOffset: s.diskOffset,
+	}
+	// Source reads borrow s; the snapshot owns only its new output.
+	copy.owner = owner
+	copy.ownsOwner = true
+	err = copy.checkpointFromLocked(owner.path, copy.Memory, copy.safeCursor(copy.Cursor), copy.messageCount(), s)
+	closeErr := owner.close()
+	copy.owner, copy.ownsOwner = nil, false
+	if err != nil || closeErr != nil {
+		return errors.Join(err, closeErr)
+	}
+	if s.saveFile == "" {
+		s.sourcePath, s.diskBase, s.diskCount, s.diskOffset = copy.sourcePath, copy.diskBase, copy.diskCount, copy.diskOffset
+		s.historyPath, s.historyCount = copy.sourcePath, copy.diskCount
+	}
+	return nil
+}
+
+func checkpointSession(path string, s *Session) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.checkpointErr != nil {
@@ -313,6 +390,7 @@ func saveSession(path string, s *Session) error {
 		return err
 	}
 	s.saveFile = s.sourcePath
+	s.historyPath, s.historyCount = s.sourcePath, s.diskCount
 	s.Cursor = cursor
 	return nil
 }
@@ -326,6 +404,10 @@ func (s *Session) sourceFile() (*os.File, bool, error) {
 }
 
 func (s *Session) checkpointLocked(path, memory string, cursor, limit int) error {
+	return s.checkpointFromLocked(path, memory, cursor, limit, s)
+}
+
+func (s *Session) checkpointFromLocked(path, memory string, cursor, limit int, sourceSession *Session) (err error) {
 	if s.checkpointErr != nil {
 		return s.checkpointErr
 	}
@@ -361,7 +443,7 @@ func (s *Session) checkpointLocked(path, memory string, cursor, limit int) error
 	success := false
 	defer func() {
 		if acquired && !success {
-			owner.close()
+			err = errors.Join(err, owner.close())
 		}
 	}()
 	base, count, offset := s.diskBase, s.diskCount, s.diskOffset
@@ -371,12 +453,12 @@ func (s *Session) checkpointLocked(path, memory string, cursor, limit int) error
 			return errors.New("save path already exists; resume it or choose a new path")
 		}
 		if s.sourcePath != "" {
-			source, closeSource, err := s.sourceFile()
-			if err != nil {
-				return err
+			source, closeSource, openErr := sourceSession.sourceFile()
+			if openErr != nil {
+				return openErr
 			}
 			if closeSource {
-				defer source.Close()
+				defer func() { err = errors.Join(err, source.Close()) }()
 			}
 			if _, err := owner.file.Seek(0, io.SeekStart); err != nil {
 				return err
@@ -417,11 +499,12 @@ func (s *Session) checkpointLocked(path, memory string, cursor, limit int) error
 	previousOwned := s.ownsOwner
 	s.owner, s.ownsOwner = owner, acquired || previousOwned
 	s.sourcePath, s.diskBase, s.diskCount, s.diskOffset = absolute, base, count, nextOffset
+	s.historyPath, s.historyCount = absolute, count
 	s.Version = sessionVersion
 	owner.created = false
 	success = true
-	if acquired && previous != nil {
-		previous.close()
+	if acquired && previousOwned && previous != nil {
+		return previous.close()
 	}
 	return nil
 }
@@ -483,6 +566,40 @@ func decodeSession(f *os.File) (*Session, error) {
 		return nil, err
 	}
 	s.sourcePath = absolute
+	s.historyPath, s.historyCount = absolute, s.diskCount
+	return s, nil
+}
+
+// Only continue keeps an output open. Failure leaves any current session intact.
+func continueSession(path string) (_ *Session, err error) {
+	owner, err := reserveSession(path, true)
+	if err != nil {
+		return nil, err
+	}
+	if owner == nil {
+		return nil, errors.New("continue path is required")
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, owner.close())
+		}
+	}()
+	s := newSession()
+	if !owner.createdNew() {
+		s, err = loadReservedSession(path, owner)
+		if err != nil {
+			return nil, err
+		}
+		if s == nil {
+			return nil, errors.New("existing session file is empty")
+		}
+	}
+	s.owner, s.ownsOwner, s.saveFile = owner, true, owner.path
+	if owner.createdNew() {
+		if err := checkpointSession(owner.path, s); err != nil {
+			return nil, err
+		}
+	}
 	return s, nil
 }
 

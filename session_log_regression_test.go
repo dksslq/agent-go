@@ -32,7 +32,7 @@ func TestLegacySessionAppendPreservesOriginalBytes(t *testing.T) {
 			}
 			t.Cleanup(s.close)
 			s.Transcript = append(s.Transcript, Message{Role: "user", Content: "continued objective"})
-			if err := saveSession(path, s); err != nil {
+			if err := checkpointSession(path, s); err != nil {
 				t.Fatal(err)
 			}
 			s.close()
@@ -53,14 +53,14 @@ func TestJournalRestartIgnoresUncommittedTailAndRepairsOnSave(t *testing.T) {
 	s := newSession()
 	t.Cleanup(s.close)
 	s.Transcript = append(s.Transcript, Message{Role: "user", Content: "initial objective"})
-	if err := saveSession(path, s); err != nil {
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	first, _ := regressionReadSavedState(t, s, path)
 	firstOffset := s.diskOffset
 	s.Memory = "Facts from the uncommitted second checkpoint."
 	s.Transcript = append(s.Transcript, Message{Role: "assistant", Content: "uncommitted result"})
-	if err := saveSession(path, s); err != nil {
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	s.close()
@@ -86,7 +86,7 @@ func TestJournalRestartIgnoresUncommittedTailAndRepairsOnSave(t *testing.T) {
 	}
 	replacement := Message{Role: "assistant", Content: "replacement after restart"}
 	restarted.Transcript = append(restarted.Transcript, replacement)
-	if err := saveSession(path, restarted); err != nil {
+	if err := checkpointSession(path, restarted); err != nil {
 		t.Fatal(err)
 	}
 	restarted.close()
@@ -106,11 +106,11 @@ func TestCommittedCheckpointChecksumCorruptionIsFatal(t *testing.T) {
 	s := newSession()
 	t.Cleanup(s.close)
 	s.Transcript = append(s.Transcript, Message{Role: "user", Content: "initial objective"})
-	if err := saveSession(path, s); err != nil {
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	s.Transcript = append(s.Transcript, Message{Role: "assistant", Content: "committed evidence"})
-	if err := saveSession(path, s); err != nil {
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	s.close()
@@ -150,7 +150,7 @@ func TestSaveAsPreservesCompactedHistoryAndSource(t *testing.T) {
 		Message{Role: "tool", ToolCallID: "exec", Name: "exec", Content: original},
 	)
 	want := append([]Message(nil), s.Transcript...)
-	if err := saveSession(path, s); err != nil {
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	if result := s.editMemory("Objective and tool evidence retained.", 0); strings.HasPrefix(result, "Error") {
@@ -159,7 +159,7 @@ func TestSaveAsPreservesCompactedHistoryAndSource(t *testing.T) {
 	next := Message{Role: "user", Content: "continue the objective"}
 	s.Transcript = append(s.Transcript, next)
 	want = append(want, next)
-	if err := saveSession(path, s); err != nil {
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	s.close()
@@ -172,13 +172,13 @@ func TestSaveAsPreservesCompactedHistoryAndSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(loaded.close)
-	if err := saveSession(copyPath, loaded); err != nil {
+	if err := checkpointSession(copyPath, loaded); err != nil {
 		t.Fatal(err)
 	}
 	continued := Message{Role: "assistant", Content: "continued once in the copy"}
 	loaded.Transcript = append(loaded.Transcript, continued)
 	want = append(want, continued)
-	if err := saveSession(copyPath, loaded); err != nil {
+	if err := checkpointSession(copyPath, loaded); err != nil {
 		t.Fatal(err)
 	}
 	loaded.close()
@@ -213,7 +213,7 @@ func TestLateSavedJournalKeepsBaseAcrossRestartAndCompaction(t *testing.T) {
 	}
 	next := Message{Role: "user", Content: "retained subsequent objective"}
 	s.Transcript = append(s.Transcript, next)
-	if err := saveSession(path, s); err != nil {
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	s.close()
@@ -222,7 +222,7 @@ func TestLateSavedJournalKeepsBaseAcrossRestartAndCompaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(restarted.close)
-	if err := saveSession(path, restarted); err != nil {
+	if err := checkpointSession(path, restarted); err != nil {
 		t.Fatal(err)
 	}
 	if result := restarted.editMemory("Objective, evidence and subsequent work retained.", 0); strings.HasPrefix(result, "Error") {
@@ -230,7 +230,7 @@ func TestLateSavedJournalKeepsBaseAcrossRestartAndCompaction(t *testing.T) {
 	}
 	completion := Message{Role: "assistant", Content: "final completion"}
 	restarted.Transcript = append(restarted.Transcript, completion)
-	if err := saveSession(path, restarted); err != nil {
+	if err := checkpointSession(path, restarted); err != nil {
 		t.Fatal(err)
 	}
 	restarted.close()
@@ -253,7 +253,7 @@ func TestCheckpointWriteFailureLeavesOldJournalReadable(t *testing.T) {
 	s := newSession()
 	t.Cleanup(s.close)
 	s.Transcript = append(s.Transcript, Message{Role: "user", Content: "retain the original objective"})
-	if err := saveSession(path, s); err != nil {
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	s.close()

@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"net/http"
+	"path/filepath"
 	"reflect"
 	"sync/atomic"
 	"testing"
@@ -90,5 +92,102 @@ func TestInferenceRequestFeedbackPreservesHistoryAndSystemPrefix(t *testing.T) {
 	}
 	if !reflect.DeepEqual(sess.Transcript[len(original)+1:len(original)+3], []Message{firstTool, lastTool}) {
 		t.Fatal("later inference rewrote completed tool results")
+	}
+}
+
+func TestSavedHistoryFeedbackPreservesRequestPrefix(t *testing.T) {
+	for _, mode := range []string{"continue", "snapshot", "loaded"} {
+		t.Run(mode, func(t *testing.T) {
+			withStreamDefaults(t)
+			path := filepath.Join(t.TempDir(), "session.json")
+			sess := newSession()
+			if mode == "continue" {
+				var err error
+				sess, err = continueSession(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			sess.Transcript = append(sess.Transcript, Message{Role: "user", Content: "Complete independent checks"})
+			if mode != "continue" {
+				if err := saveSession(path, sess); err != nil {
+					t.Fatal(err)
+				}
+				if mode == "loaded" {
+					var err error
+					sess, err = loadSession(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			t.Cleanup(sess.close)
+			type capturedRequest struct {
+				bytes      int
+				messages   []Message
+				historyEnd int
+			}
+			requests := make(chan capturedRequest, 4)
+			var count atomic.Int32
+			withSSEServer(t, func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				var request ChatRequest
+				if err := json.Unmarshal(body, &request); err != nil {
+					t.Error(err)
+					return
+				}
+				// Verify the advertised bound against committed records, including
+				// Windows where the active owner must supply the read handle.
+				var saved sessionLogState
+				func() {
+					sess.mu.Lock()
+					defer sess.mu.Unlock()
+					_, saved = regressionReadSavedState(t, sess, path)
+				}()
+				requests <- capturedRequest{len(body), request.Messages, saved.Count}
+				if count.Add(1) < 4 {
+					io.WriteString(w, toolCallChunk(t, 0, "one", "unknown_first", `{}`)+
+						toolCallChunk(t, 1, "two", "unknown_second", `{}`)+deltaChunk(t, nil, "tool_calls"))
+					return
+				}
+				io.WriteString(w, deltaChunk(t, map[string]interface{}{contentField: "done"}, "stop"))
+			})
+			if err := runInferenceLoop(context.Background(), sess); err != nil {
+				t.Fatal(err)
+			}
+			if count.Load() != 4 {
+				t.Fatalf("inference made %d requests, want 4", count.Load())
+			}
+			previous := <-requests
+			for round := 1; round < 4; round++ {
+				current := <-requests
+				before, _ := json.Marshal(previous.messages)
+				after, _ := json.Marshal(current.messages)
+				if len(current.messages) != len(previous.messages)+3 || !bytes.HasPrefix(after, before[:len(before)-1]) {
+					t.Fatalf("round %d changed the cached system/history prefix", round)
+				}
+				var feedback ToolResult
+				last := current.messages[len(current.messages)-1]
+				if err := json.Unmarshal([]byte(last.Content.(string)), &feedback); err != nil {
+					t.Fatal(err)
+				}
+				if feedback.HistoryNext != current.historyEnd || feedback.LastRequestBytes != previous.bytes {
+					t.Fatalf("round %d: history_next=%d, saved end=%d; last_request_bytes=%d, prior request=%d", round,
+						feedback.HistoryNext, current.historyEnd, feedback.LastRequestBytes, previous.bytes)
+				}
+				var first map[string]json.RawMessage
+				if err := json.Unmarshal([]byte(current.messages[len(current.messages)-2].Content.(string)), &first); err != nil {
+					t.Fatal(err)
+				}
+				if _, exists := first["history_next"]; exists {
+					t.Fatal("history feedback was attached to multiple tool results")
+				}
+				previous = current
+			}
+		})
 	}
 }

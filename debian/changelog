@@ -1,3 +1,12 @@
+agentlet (2.4.0-1) unstable; urgency=medium
+
+  * Restore a valid conversation start after autonomous memory compaction.
+  * Separate Save As snapshots, read-only loading and continuous persistence.
+  * Add explicit read-only history recall without implicit files or caches.
+  * Keep request prefixes stable and avoid signalling completed Unix commands.
+
+ -- dksslq <dksslq@users.noreply.github.com>  Wed, 14 Oct 2026 00:00:00 +0000
+
 agentlet (2.3.0-1) unstable; urgency=medium
 
   * Remove implicit archives and temporary session snapshots.

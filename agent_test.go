@@ -178,7 +178,7 @@ func sampleTranscript() []Message {
 func TestSessionRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "s.json")
 	want := &Session{Transcript: sampleTranscript(), Memory: "durable facts", Cursor: 2}
-	if err := saveSession(path, want); err != nil {
+	if err := checkpointSession(path, want); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	want.close()
@@ -276,12 +276,12 @@ func TestSaveSessionAppendsCheckpoints(t *testing.T) {
 	path := filepath.Join(dir, "s.json")
 	s := &Session{Transcript: sampleTranscript(), Memory: "one"}
 	t.Cleanup(s.close)
-	if err := saveSession(path, s); err != nil {
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	s.Memory = "two"
 	s.Transcript = append(s.Transcript, Message{Role: "assistant", Content: "new evidence"})
-	if err := saveSession(path, s); err != nil {
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
 	got, err := loadReservedSession(path, s.owner)
@@ -299,7 +299,7 @@ func TestSaveSessionAppendsCheckpoints(t *testing.T) {
 }
 
 func TestSaveSessionBadPath(t *testing.T) {
-	if err := saveSession(filepath.Join(t.TempDir(), "no-such-dir", "s.json"), &Session{}); err == nil {
+	if err := checkpointSession(filepath.Join(t.TempDir(), "no-such-dir", "s.json"), &Session{}); err == nil {
 		t.Fatal("expected save error for bad path")
 	}
 }
@@ -607,7 +607,7 @@ func TestEditMemory(t *testing.T) {
 		s := fresh(t)
 		s.Transcript = append(s.Transcript, Message{Role: "user", Content: "u3"}, Message{Role: "assistant", ToolCalls: []ToolCall{{ID: "pending", Type: "function", Function: FunctionCall{Name: "memory_edit", Arguments: `{"memory":"continue u3"}`}}}})
 		s.editMemory("continue u3", 99)
-		if s.Cursor != 7 || len(s.contextMessages()) != 3 || s.contextMessages()[2].Role != "assistant" {
+		if s.Cursor != 7 || len(s.contextMessages()) != 4 || s.contextMessages()[2].Role != "user" || s.contextMessages()[3].Role != "assistant" {
 			t.Fatal("pending group removed")
 		}
 	})

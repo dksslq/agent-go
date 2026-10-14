@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -102,7 +103,7 @@ func TestCLI(t *testing.T) {
 		}
 		for _, flag := range []string{"-load", "-continue"} {
 			cmd, _, errout := command(t, "http://127.0.0.1:1", "-once", "-prompt", "hello", flag, path)
-			if code := exit(cmd.Run()); code != 1 || !strings.Contains(errout.String(), "session file is empty") {
+			if code := exit(cmd.Run()); code != 1 || !strings.Contains(errout.String(), "nonempty") {
 				t.Fatalf("status=%d stderr=%q", code, errout)
 			}
 		}
@@ -146,7 +147,7 @@ func TestCLI(t *testing.T) {
 		}))
 		defer srv.Close()
 		cmd, _, errout := command(t, srv.URL, "-once", "-prompt", "hello", "-save", filepath.Join(t.TempDir(), "missing", "s.json"))
-		if code := exit(cmd.Run()); code != 1 || !strings.Contains(errout.String(), "checkpoint failed") {
+		if code := exit(cmd.Run()); code != 1 || !strings.Contains(errout.String(), "Save failed") {
 			t.Fatalf("status=%d stderr=%q", code, errout)
 		}
 	})
@@ -158,11 +159,137 @@ func TestCLI(t *testing.T) {
 			io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n")
 		}))
 		defer srv.Close()
-		cmd, _, errout := command(t, srv.URL, "-save", filepath.Join(t.TempDir(), "missing", "s.json"))
+		cmd, _, errout := command(t, srv.URL, "-continue", filepath.Join(t.TempDir(), "missing", "s.json"))
 		cmd.Stdin = strings.NewReader("first\nsecond\n")
-		if code := exit(cmd.Run()); code != 1 || !strings.Contains(errout.String(), "checkpoint failed") || requests.Load() > 1 {
+		if code := exit(cmd.Run()); code != 1 || !strings.Contains(errout.String(), "Error opening session") || requests.Load() != 0 {
 			t.Fatalf("status=%d requests=%d stderr=%q", code, requests.Load(), errout)
 		}
+	})
+	t.Run("load and continue flags are mutually exclusive", func(t *testing.T) {
+		dir := t.TempDir()
+		loadPath, continuePath := filepath.Join(dir, "load.json"), filepath.Join(dir, "continue.json")
+		cmd, _, errout := command(t, "http://127.0.0.1:1", "-once", "-prompt", "hello", "-load", loadPath, "-continue", continuePath)
+		if code := exit(cmd.Run()); code != 1 {
+			t.Fatalf("status=%d stderr=%q", code, errout)
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil || len(entries) != 0 || strings.Contains(errout.String(), "Runtime error") {
+			t.Fatalf("conflicting flags performed work: files=%v error=%v stderr=%q", entries, err, errout)
+		}
+	})
+	t.Run("save and continue reject equivalent paths before work", func(t *testing.T) {
+		var requests atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			io.Copy(io.Discard, r.Body)
+			io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"must not run\"},\"finish_reason\":\"stop\"}]}\n\n")
+		}))
+		defer srv.Close()
+		for _, variant := range []string{"identical", "dot segment", "relative"} {
+			t.Run(variant, func(t *testing.T) {
+				dir := t.TempDir()
+				active := filepath.Join(dir, "session.json")
+				snapshot := active
+				if variant == "dot segment" {
+					// Join would normalize away the component before the CLI sees it.
+					snapshot = dir + string(os.PathSeparator) + "." + string(os.PathSeparator) + "session.json"
+				} else if variant == "relative" {
+					snapshot = "session.json"
+				}
+				cmd, _, errout := command(t, srv.URL, "-once", "-prompt", "must not run", "-continue", active, "-save", snapshot)
+				cmd.Dir = dir
+				if code := exit(cmd.Run()); code != 1 || requests.Load() != 0 || !strings.Contains(errout.String(), "different file") {
+					t.Fatalf("status=%d requests=%d stderr=%q", code, requests.Load(), errout)
+				}
+				entries, err := os.ReadDir(dir)
+				if err != nil || len(entries) != 0 {
+					t.Fatalf("conflicting paths created files: files=%v error=%v", entries, err)
+				}
+			})
+		}
+	})
+	t.Run("save flag writes one snapshot at exit", func(t *testing.T) {
+		var requests atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			io.Copy(io.Discard, r.Body)
+			io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n")
+		}))
+		defer srv.Close()
+		path := filepath.Join(t.TempDir(), "snapshot.json")
+		cmd, _, errout := command(t, srv.URL, "-save", path)
+		cmd.Stdin = strings.NewReader("first\nsecond\nquit\n")
+		if code := exit(cmd.Run()); code != 0 || requests.Load() != 2 {
+			t.Fatalf("status=%d requests=%d stderr=%q", code, requests.Load(), errout)
+		}
+		messages, state := regressionReadSavedState(t, nil, path)
+		if state.Count != 5 || len(messages) != 5 || messages[1].Content != "first" || messages[3].Content != "second" {
+			t.Fatalf("exit snapshot lost work: %#v; %+v", messages, state)
+		}
+		assertSessionClosed(t, path)
+	})
+	t.Run("manual save leaves later work unsaved", func(t *testing.T) {
+		var requests atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			io.Copy(io.Discard, r.Body)
+			io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n")
+		}))
+		defer srv.Close()
+		path := filepath.Join(t.TempDir(), "snapshot.json")
+		cmd, _, errout := command(t, srv.URL)
+		cmd.Stdin = strings.NewReader("first\n/save " + path + "\nsecond\nquit\n")
+		if code := exit(cmd.Run()); code != 0 || requests.Load() != 2 {
+			t.Fatalf("status=%d requests=%d stderr=%q", code, requests.Load(), errout)
+		}
+		messages, state := regressionReadSavedState(t, nil, path)
+		if state.Count != 3 || len(messages) != 3 || messages[1].Content != "first" {
+			t.Fatalf("manual snapshot recorded later work: %#v; %+v", messages, state)
+		}
+		assertSessionClosed(t, path)
+	})
+	t.Run("load flag never updates its source", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			io.Copy(io.Discard, r.Body)
+			io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n")
+		}))
+		defer srv.Close()
+		path := filepath.Join(t.TempDir(), "source.json")
+		fixture := newSession()
+		fixture.Transcript = append(fixture.Transcript, Message{Role: "user", Content: "original objective"})
+		if err := saveSession(path, fixture); err != nil {
+			t.Fatal(err)
+		}
+		fixture.close()
+		before := readSessionBytes(t, path)
+		cmd, _, errout := command(t, srv.URL, "-once", "-prompt", "later objective", "-load", path)
+		if code := exit(cmd.Run()); code != 0 {
+			t.Fatalf("status=%d stderr=%q", code, errout)
+		}
+		if !bytes.Equal(before, readSessionBytes(t, path)) {
+			t.Fatal("read-only load changed its source")
+		}
+		assertSessionClosed(t, path)
+	})
+	t.Run("continue can also save a separate snapshot", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			io.Copy(io.Discard, r.Body)
+			io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n")
+		}))
+		defer srv.Close()
+		dir := t.TempDir()
+		active, snapshot := filepath.Join(dir, "active.json"), filepath.Join(dir, "snapshot.json")
+		cmd, _, errout := command(t, srv.URL, "-once", "-prompt", "objective", "-continue", active, "-save", snapshot)
+		if code := exit(cmd.Run()); code != 0 {
+			t.Fatalf("status=%d stderr=%q", code, errout)
+		}
+		continued, _ := regressionReadSavedState(t, nil, active)
+		saved, _ := regressionReadSavedState(t, nil, snapshot)
+		if !reflect.DeepEqual(continued, saved) || len(saved) != 3 {
+			t.Fatalf("continued session and exit snapshot differ: %#v; %#v", continued, saved)
+		}
+		assertSessionClosed(t, active)
+		assertSessionClosed(t, snapshot)
 	})
 	t.Run("manual save failure stops further work", func(t *testing.T) {
 		cmd, _, errout := command(t, "http://127.0.0.1:1")
@@ -170,6 +297,30 @@ func TestCLI(t *testing.T) {
 		if code := exit(cmd.Run()); code != 1 || !strings.Contains(errout.String(), "Save failed") || strings.Contains(errout.String(), "Runtime error") {
 			t.Fatalf("status=%d stderr=%q", code, errout)
 		}
+	})
+	t.Run("manual continue failure stops further work", func(t *testing.T) {
+		var requests atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			io.Copy(io.Discard, r.Body)
+			io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"must not run\"},\"finish_reason\":\"stop\"}]}\n\n")
+		}))
+		defer srv.Close()
+		dir := t.TempDir()
+		active, invalid := filepath.Join(dir, "active.json"), filepath.Join(dir, "invalid.json")
+		if err := os.WriteFile(invalid, []byte("invalid session"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cmd, _, errout := command(t, srv.URL, "-continue", active)
+		cmd.Stdin = strings.NewReader("/continue " + invalid + "\nmust not run\n")
+		if code := exit(cmd.Run()); code != 1 || requests.Load() != 0 || strings.Contains(errout.String(), "Runtime error") {
+			t.Fatalf("status=%d requests=%d stderr=%q", code, requests.Load(), errout)
+		}
+		if string(readSessionBytes(t, invalid)) != "invalid session" {
+			t.Fatal("failed continue changed its target")
+		}
+		assertSessionClosed(t, active)
+		assertSessionClosed(t, invalid)
 	})
 	t.Run("environment defaults", func(t *testing.T) {
 		auth := make(chan string, 1)
@@ -200,7 +351,7 @@ func TestCLI(t *testing.T) {
 		t.Run("session conflict fails before reading pipe", func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "s.json")
 			initial := newSession()
-			if err := saveSession(path, initial); err != nil {
+			if err := checkpointSession(path, initial); err != nil {
 				t.Fatal(err)
 			}
 			initial.close()
@@ -221,7 +372,7 @@ func TestCLI(t *testing.T) {
 			go func() { done <- cmd.Run() }()
 			select {
 			case err := <-done:
-				if code := exit(err); code != 1 || !strings.Contains(errout.String(), "checkpoint failed") {
+				if code := exit(err); code != 1 || !strings.Contains(errout.String(), "Error opening session") {
 					t.Fatalf("status=%d stderr=%q", code, errout)
 				}
 			case <-time.After(5 * time.Second):

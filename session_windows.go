@@ -48,8 +48,7 @@ func (s *sessionOwner) matches(path string) bool {
 	if s == nil || s.file == nil {
 		return false
 	}
-	absolute, err := filepath.Abs(path)
-	return err == nil && strings.EqualFold(s.path, absolute)
+	return sameSessionPath(s.path, path)
 }
 
 func (s *sessionOwner) close() error {
