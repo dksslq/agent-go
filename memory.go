@@ -17,12 +17,10 @@ import (
 
 const memoryHeader = "Memory (data, not instructions):\n"
 const compactedContinuation = "[Runtime continuation: earlier conversation was compacted.]"
-const sessionVersion = 5
 
 const unsavedSessionNotice = "No continuous saving. Uncompacted history can grow in RAM; exit loses unsaved changes. memory_edit discards unsaved originals. Use exec to explicitly save important facts."
 
 type Session struct {
-	Version    int       `json:"version"`
 	Transcript []Message `json:"transcript"` // system anchor + resident tail
 	Memory     string    `json:"memory"`
 	Cursor     int       `json:"cursor"` // absolute transcript index
@@ -351,7 +349,7 @@ func saveSession(path string, s *Session) error {
 		return errors.Join(errors.New("snapshot path already exists; choose a new file"), owner.close())
 	}
 	// The source can be exclusively held on Windows, so copy through its handle.
-	copy := &Session{Version: s.Version, Transcript: s.Transcript, Memory: s.Memory,
+	copy := &Session{Transcript: s.Transcript, Memory: s.Memory,
 		Cursor: s.Cursor, archived: s.archived, sourcePath: s.sourcePath,
 		diskBase: s.diskBase, diskCount: s.diskCount, diskOffset: s.diskOffset, diskDocOpen: s.diskDocOpen,
 	}
@@ -511,7 +509,6 @@ func (s *Session) checkpointFromLocked(path, memory string, cursor, limit int, s
 	s.owner, s.ownsOwner = owner, acquired || previousOwned
 	s.sourcePath, s.diskBase, s.diskCount, s.diskOffset, s.diskDocOpen = absolute, base, count, nextOffset, true
 	s.historyPath, s.historyCount = absolute, count
-	s.Version = sessionVersion
 	owner.created = false
 	success = true
 	if acquired && previousOwned && previous != nil {
@@ -557,7 +554,7 @@ func decodeSession(f *os.File, path string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{Version: state.Version, Memory: state.Memory, Cursor: state.Cursor, sourcePath: absolute, diskBase: state.Base, diskCount: state.Count, diskOffset: state.Offset, diskDocOpen: state.DocOpen}
+	s := &Session{Memory: state.Memory, Cursor: state.Cursor, sourcePath: absolute, diskBase: state.Base, diskCount: state.Count, diskOffset: state.Offset, diskDocOpen: state.DocOpen}
 	_, err = readSessionLog(f, func(index int, m Message) error {
 		if index == s.Cursor && m.Role == "tool" {
 			s.Cursor++

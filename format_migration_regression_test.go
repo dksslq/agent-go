@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -8,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestV4JournalContinuesAsV5(t *testing.T) {
+func TestV4JournalContinuesAsDocument(t *testing.T) {
 	// Hand-built v4 journal: one initial checkpoint record (old envelope format).
 	path := filepath.Join(t.TempDir(), "v4session.json")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
@@ -37,7 +38,7 @@ func TestV4JournalContinuesAsV5(t *testing.T) {
 	if s.messageCount() != 2 {
 		t.Fatalf("v4 count: %d", s.messageCount())
 	}
-	// Continue: append a v5 document after the journal.
+	// Continue: append a session document after the journal.
 	s.saveFile = path
 	s.owner, err = reserveSession(path, true)
 	if err != nil {
@@ -46,12 +47,15 @@ func TestV4JournalContinuesAsV5(t *testing.T) {
 	s.ownsOwner = true
 	s.Transcript = append(s.Transcript, Message{Role: "assistant", Content: "new answer"})
 	if err := checkpointSession(path, s); err != nil {
-		t.Fatalf("v5 migrate append: %v", err)
+		t.Fatalf("migration append: %v", err)
 	}
 	s.close()
 	after, _ := os.ReadFile(path)
 	if string(after[:len(before)]) != string(before) {
 		t.Fatalf("migration rewrote the v4 prefix")
+	}
+	if appendix := after[len(before):]; bytes.Contains(appendix, []byte("version")) {
+		t.Fatalf("migration appended a version tag: %s", appendix)
 	}
 	fmt.Printf("migrated file:\n%s\n", after[len(before):])
 	restarted, err := loadSession(path)

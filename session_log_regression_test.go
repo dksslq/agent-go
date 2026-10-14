@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -261,5 +262,127 @@ func TestCheckpointWriteFailureLeavesOldJournalReadable(t *testing.T) {
 	t.Cleanup(restarted.close)
 	if restarted.messageCount() != 2 || restarted.Cursor != 1 || restarted.Memory != "" || restarted.Transcript[1].Content != "retain the original objective" {
 		t.Fatalf("failed write changed restart state: %+v", restarted)
+	}
+}
+
+func TestSessionDocumentHasNoVersionTag(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.json")
+	s := newSession()
+	t.Cleanup(s.close)
+	s.Transcript = append(s.Transcript, Message{Role: "user", Content: "objective"})
+	if err := checkpointSession(path, s); err != nil {
+		t.Fatal(err)
+	}
+	s.close()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("version")) {
+		t.Fatalf("document carries a version tag: %s", raw)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("document is not one JSON object: %v", err)
+	}
+	if _, ok := doc["m0"]; !ok {
+		t.Fatalf("document lacks the system message: %s", raw)
+	}
+	if _, ok := doc["state"]; !ok {
+		t.Fatalf("document lacks its state: %s", raw)
+	}
+	reloaded, err := loadSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(reloaded.close)
+	reloaded.Transcript = append(reloaded.Transcript, Message{Role: "assistant", Content: "answer"})
+	if err := checkpointSession(path, reloaded); err != nil {
+		t.Fatal(err)
+	}
+	reloaded.close()
+	raw, err = os.ReadFile(path)
+	if err != nil || bytes.Contains(raw, []byte("version")) {
+		t.Fatalf("appended document carries a version tag: %s; %v", raw, err)
+	}
+	messages, state := regressionReadSavedState(t, nil, path)
+	if state.Count != 3 || len(messages) != 3 || messages[2].Content != "answer" {
+		t.Fatalf("round trip lost messages: %#v; %+v", messages, state)
+	}
+}
+
+func TestVersionedDocumentStillLoadsAndContinues(t *testing.T) {
+	// A v2.5.0 document carries a leading "version": 5 member; it must keep
+	// loading, and its continuation must append the current tagless form.
+	path := filepath.Join(t.TempDir(), "v250.json")
+	doc := "{\n  \"version\": 5,\n  \"m0\": {\"role\":\"system\",\"content\":\"old system\"}," +
+		"\n  \"m1\": {\"role\":\"user\",\"content\":\"old task\"}," +
+		"\n  \"state\": {\"base\":0,\"cursor\":1,\"memory\":\"\"}\n}\n"
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadSession(path)
+	if err != nil {
+		t.Fatalf("v2.5.0 load: %v", err)
+	}
+	t.Cleanup(s.close)
+	if s.messageCount() != 2 || s.Transcript[1].Content != "old task" {
+		t.Fatalf("v2.5.0 session wrong: %+v", s)
+	}
+	s.saveFile = path
+	s.owner, err = reserveSession(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.ownsOwner = true
+	s.Transcript = append(s.Transcript, Message{Role: "assistant", Content: "new answer"})
+	if err := checkpointSession(path, s); err != nil {
+		t.Fatalf("continue v2.5.0: %v", err)
+	}
+	s.close()
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The append reopens the document by replacing its closing "\n}\n".
+	committed := doc[:len(doc)-3]
+	if !bytes.HasPrefix(after, []byte(committed)) {
+		t.Fatalf("continuation rewrote the v2.5.0 bytes")
+	}
+	if appendix := after[len(committed):]; bytes.Contains(appendix, []byte("version")) {
+		t.Fatalf("continuation reintroduced a version tag: %s", appendix)
+	}
+	restarted, err := loadSession(path)
+	if err != nil {
+		t.Fatalf("reload continued v2.5.0: %v", err)
+	}
+	t.Cleanup(restarted.close)
+	if restarted.messageCount() != 3 || restarted.Transcript[2].Content != "new answer" {
+		t.Fatalf("continued session wrong: %+v", restarted)
+	}
+}
+
+func TestTornFirstWriteLoadsAsEmpty(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "torn.json")
+	s := newSession()
+	t.Cleanup(s.close)
+	s.Transcript = append(s.Transcript, Message{Role: "user", Content: "objective"})
+	if err := checkpointSession(path, s); err != nil {
+		t.Fatal(err)
+	}
+	s.close()
+	complete, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cut := bytes.Index(complete, []byte("\"m0\""))
+	if cut < 0 {
+		t.Fatal("fixture lacks the system message")
+	}
+	if err := os.WriteFile(path, complete[:cut+4], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if reloaded, err := loadSession(path); err != nil || reloaded != nil {
+		t.Fatalf("torn first write did not load as empty: %v; %+v", err, reloaded)
 	}
 }

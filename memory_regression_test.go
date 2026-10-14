@@ -256,7 +256,7 @@ func TestInvalidSessionCannotReplaceSavedState(t *testing.T) {
 func TestLoadRejectsInvalidSessionSemantics(t *testing.T) {
 	cases := []string{
 		`null`, `{}`, `[]`,
-		`{"version":` + strconv.Itoa(sessionVersion+1) + `,"transcript":[{"role":"system","content":"s"}]}`,
+		`{"version":6,"transcript":[{"role":"system","content":"s"}]}`,
 		`{"transcript":[{"role":"user","content":"u"}]}`,
 		`{"transcript":[{"role":"system"},{"role":"unknown"}]}`,
 		`{"transcript":[{"role":"system","content":{"invalid":"shape"}}]}`,
