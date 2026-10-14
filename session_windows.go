@@ -44,13 +44,6 @@ func reserveSession(path string, create bool) (*sessionOwner, error) {
 
 func (s *sessionOwner) createdNew() bool { return s != nil && s.file != nil && s.created }
 
-func (s *sessionOwner) matches(path string) bool {
-	if s == nil || s.file == nil {
-		return false
-	}
-	return sameSessionPath(s.path, path)
-}
-
 func (s *sessionOwner) close() error {
 	if s != nil && s.file != nil {
 		var cleanupErr error

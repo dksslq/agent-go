@@ -177,12 +177,12 @@ func TestCLI(t *testing.T) {
 			t.Fatalf("conflicting flags performed work: files=%v error=%v stderr=%q", entries, err, errout)
 		}
 	})
-	t.Run("save and continue reject equivalent paths before work", func(t *testing.T) {
+	t.Run("save conflicts with the continued file fail at write time", func(t *testing.T) {
 		var requests atomic.Int32
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			requests.Add(1)
 			io.Copy(io.Discard, r.Body)
-			io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"must not run\"},\"finish_reason\":\"stop\"}]}\n\n")
+			io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"work done\"},\"finish_reason\":\"stop\"}}]}\n\n")
 		}))
 		defer srv.Close()
 		for _, variant := range []string{"identical", "dot segment", "relative"} {
@@ -196,19 +196,22 @@ func TestCLI(t *testing.T) {
 				} else if variant == "relative" {
 					snapshot = "session.json"
 				}
-				cmd, _, errout := command(t, srv.URL, "-once", "-prompt", "must not run", "-continue", active, "-save", snapshot)
+				before := requests.Load()
+				cmd, _, errout := command(t, srv.URL, "-once", "-prompt", "work done", "-continue", active, "-save", snapshot)
 				cmd.Dir = dir
-				if code := exit(cmd.Run()); code != 1 || requests.Load() != 0 || !strings.Contains(errout.String(), "different file") {
+				if code := exit(cmd.Run()); code != 1 || requests.Load() != before+1 || !strings.Contains(errout.String(), "Save failed") {
 					t.Fatalf("status=%d requests=%d stderr=%q", code, requests.Load(), errout)
 				}
-				entries, err := os.ReadDir(dir)
-				if err != nil || len(entries) != 0 {
-					t.Fatalf("conflicting paths created files: files=%v error=%v", entries, err)
+				// The write-time guard rejects the conflicting snapshot while the
+				// continued file keeps the finished turn.
+				messages, state := regressionReadSavedState(t, nil, active)
+				if state.Count != 3 || messages[1].Content != "work done" {
+					t.Fatalf("conflicting save corrupted the continued file: %#v; %+v", messages, state)
 				}
 			})
 		}
 	})
-	t.Run("save and continue reject directory aliases before work", func(t *testing.T) {
+	t.Run("aliased save conflicts fail at write time without corruption", func(t *testing.T) {
 		if runtime.GOOS == "windows" {
 			t.Skip("creating symbolic links requires additional Windows privileges")
 		}
@@ -216,7 +219,7 @@ func TestCLI(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			requests.Add(1)
 			io.Copy(io.Discard, r.Body)
-			io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"must not run\"},\"finish_reason\":\"stop\"}]}\n\n")
+			io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"work done\"},\"finish_reason\":\"stop\"}}]}\n\n")
 		}))
 		defer srv.Close()
 		dir := t.TempDir()
@@ -228,13 +231,19 @@ func TestCLI(t *testing.T) {
 			t.Fatal(err)
 		}
 		active, snapshot := filepath.Join(aliasDir, "session.json"), filepath.Join(realDir, "session.json")
-		cmd, _, errout := command(t, srv.URL, "-once", "-prompt", "must not run", "-continue", active, "-save", snapshot)
-		if code := exit(cmd.Run()); code != 1 || requests.Load() != 0 || !strings.Contains(errout.String(), "different file") {
+		cmd, _, errout := command(t, srv.URL, "-once", "-prompt", "work done", "-continue", active, "-save", snapshot)
+		if code := exit(cmd.Run()); code != 1 || requests.Load() != 1 || !strings.Contains(errout.String(), "Save failed") {
 			t.Fatalf("status=%d requests=%d stderr=%q", code, requests.Load(), errout)
 		}
+		// The continued file (created through the alias) keeps the finished
+		// turn; the aliased snapshot was rejected by the write-time guard.
+		messages, state := regressionReadSavedState(t, nil, snapshot)
+		if state.Count != 3 || messages[1].Content != "work done" {
+			t.Fatalf("aliased save corrupted the continued file: %#v; %+v", messages, state)
+		}
 		entries, err := os.ReadDir(realDir)
-		if err != nil || len(entries) != 0 {
-			t.Fatalf("aliased target conflict created files: files=%v error=%v", entries, err)
+		if err != nil || len(entries) != 1 {
+			t.Fatalf("unexpected files after aliased conflict: files=%v error=%v", entries, err)
 		}
 	})
 	t.Run("save flag writes one snapshot at exit", func(t *testing.T) {

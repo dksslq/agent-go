@@ -27,57 +27,35 @@ type Session struct {
 	Memory     string    `json:"memory"`
 	Cursor     int       `json:"cursor"` // absolute transcript index
 
-	mu               sync.Mutex
-	archived         int // non-system messages removed from RAM; absolute indices stay stable
-	sourcePath       string
-	historyPath      string // explicitly selected archive; may outlive the copyable prefix
-	historyCount     int
-	diskBase         int
-	diskCount        int
-	diskOffset       int64
-	saveFile         string
-	owner            *sessionOwner
-	ownsOwner        bool
-	checkpointErr    error
-	lastRequestBytes int
+	mu                sync.Mutex
+	archived          int // non-system messages removed from RAM; absolute indices stay stable
+	sourcePath        string
+	historyPath       string // explicitly selected archive; may outlive the copyable prefix
+	historyCount      int
+	diskBase          int
+	diskCount         int
+	diskOffset        int64
+	saveFile          string
+	owner             *sessionOwner
+	ownsOwner         bool
+	checkpointErr     error
+	checkpointErrPath string // the only file checkpointErr keeps fail-closed
+	lastRequestBytes  int
 }
 
 func newSession() *Session {
 	return &Session{Transcript: []Message{{Role: "system", Content: systemRules()}}, Cursor: 1}
 }
 
-func sameSessionPath(left, right string) bool {
-	if left == "" || right == "" {
+// owner.path is absolute by construction (reserveSession). Comparison is
+// lexical: aliasing (symlinks, links, case) is external, and a mismatch is
+// simply reported at open or write time with the underlying OS error.
+func (s *sessionOwner) matches(path string) bool {
+	if s == nil || s.file == nil || path == "" {
 		return false
 	}
-	a, err := filepath.Abs(left)
-	if err != nil {
-		return false
-	}
-	b, err := filepath.Abs(right)
-	if err != nil {
-		return false
-	}
-	equal := func(a, b string) bool {
-		if runtime.GOOS == "windows" {
-			return strings.EqualFold(a, b)
-		}
-		return a == b
-	}
-	if equal(a, b) {
-		return true
-	}
-	resolve := func(path string) string {
-		if resolved, err := filepath.EvalSymlinks(path); err == nil {
-			return resolved
-		}
-		// A new snapshot has no leaf yet; resolve its existing parent.
-		if parent, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
-			return filepath.Join(parent, filepath.Base(path))
-		}
-		return path
-	}
-	return equal(resolve(a), resolve(b))
+	absolute, err := filepath.Abs(path)
+	return err == nil && absolute == s.path
 }
 
 func (s *Session) messageCount() int { return s.archived + len(s.Transcript) }
@@ -206,7 +184,7 @@ func (s *Session) editMemory(memory string, cursor int) string {
 	cursor = s.safeCursor(cursor)
 	if s.saveFile != "" {
 		if err := s.checkpointLocked(s.saveFile, memory, cursor, cursor); err != nil {
-			s.checkpointErr = err
+			s.checkpointErr, s.checkpointErrPath = err, s.saveFile
 			return fmt.Sprintf("Error: memory unchanged; checkpoint failed: %v", err)
 		}
 	} else if cursor > s.diskCount {
@@ -361,9 +339,6 @@ func (v *transcriptValidator) finish() error {
 func saveSession(path string, s *Session) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.checkpointErr != nil {
-		return s.checkpointErr
-	}
 	owner, err := reserveSession(path, true)
 	if err != nil {
 		return err
@@ -398,9 +373,6 @@ func saveSession(path string, s *Session) error {
 func checkpointSession(path string, s *Session) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.checkpointErr != nil {
-		return s.checkpointErr
-	}
 	cursor := s.safeCursor(s.Cursor)
 	if err := s.checkpointLocked(path, s.Memory, cursor, s.messageCount()); err != nil {
 		return err
@@ -424,15 +396,17 @@ func (s *Session) checkpointLocked(path, memory string, cursor, limit int) error
 }
 
 func (s *Session) checkpointFromLocked(path, memory string, cursor, limit int, sourceSession *Session) (err error) {
-	if s.checkpointErr != nil {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	// A failed checkpoint stays fail-closed for its own file only; a different
+	// target never writes that file, it copies its last committed prefix.
+	if s.checkpointErr != nil && s.checkpointErrPath == absolute {
 		return s.checkpointErr
 	}
 	if cursor > 1 && strings.TrimSpace(memory) == "" {
 		return errors.New("compacted session requires semantic memory")
-	}
-	absolute, err := filepath.Abs(path)
-	if err != nil {
-		return err
 	}
 	end := limit - s.archived
 	if end < 1 || end > len(s.Transcript) {
@@ -538,21 +512,19 @@ func loadSession(path string) (*Session, error) {
 		return nil, err
 	}
 	defer f.Close()
-	return decodeSession(f)
+	return decodeSession(f, path)
 }
 
 func loadReservedSession(path string, owner *sessionOwner) (*Session, error) {
 	if !owner.matches(path) {
 		return loadSession(path)
 	}
-	s, err := decodeSession(owner.file)
-	if s != nil {
-		s.sourcePath = owner.path
-	}
-	return s, err
+	return decodeSession(owner.file, owner.path)
 }
 
-func decodeSession(f *os.File) (*Session, error) {
+// The session's own paths come from the caller's path, never from the handle
+// name: on Windows an exclusively opened handle is named with a \\?\ prefix.
+func decodeSession(f *os.File, path string) (*Session, error) {
 	state, err := readSessionLog(f, nil)
 	if err != nil {
 		return nil, err
@@ -560,7 +532,11 @@ func decodeSession(f *os.File) (*Session, error) {
 	if state.Count == 0 {
 		return nil, nil
 	}
-	s := &Session{Version: state.Version, Memory: state.Memory, Cursor: state.Cursor, sourcePath: f.Name(), diskBase: state.Base, diskCount: state.Count, diskOffset: state.Offset}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	s := &Session{Version: state.Version, Memory: state.Memory, Cursor: state.Cursor, sourcePath: absolute, diskBase: state.Base, diskCount: state.Count, diskOffset: state.Offset}
 	_, err = readSessionLog(f, func(index int, m Message) error {
 		if index == s.Cursor && m.Role == "tool" {
 			s.Cursor++
@@ -577,11 +553,6 @@ func decodeSession(f *os.File) (*Session, error) {
 	if s.Cursor > 1 && strings.TrimSpace(s.Memory) == "" {
 		return nil, errors.New("compacted session requires semantic memory")
 	}
-	absolute, err := filepath.Abs(s.sourcePath)
-	if err != nil {
-		return nil, err
-	}
-	s.sourcePath = absolute
 	s.historyPath, s.historyCount = absolute, s.diskCount
 	return s, nil
 }

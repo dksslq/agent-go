@@ -85,19 +85,6 @@ func run(args []string) (status int) {
 		infof("Error: -load and -continue are mutually exclusive\n")
 		return 1
 	}
-	if sameSessionPath(*save, *resume) {
-		infof("Save failed: snapshot must use a different file from -continue\n")
-		return 1
-	}
-	if *save != "" {
-		if _, err := os.Lstat(*save); !errors.Is(err, os.ErrNotExist) {
-			if err == nil {
-				err = errors.New("path already exists")
-			}
-			infof("Save failed: snapshot requires a new file: %v\n", err)
-			return 1
-		}
-	}
 	ctx, shutdown := context.WithCancel(context.Background())
 	defer shutdown()
 	stdoutWriter = newOutputWriter(ctx, os.Stdout)

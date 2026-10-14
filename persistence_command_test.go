@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -40,27 +39,69 @@ func assertSessionClosed(t *testing.T, path string) {
 	}
 }
 
-func TestSessionPathResolvesDirectoryAliasesForNewFiles(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("creating symbolic links requires additional Windows privileges")
-	}
+// The session's own paths must come from the caller's path, never from the
+// handle name: on Windows an exclusively opened handle carries a \\?\ prefix
+// that then misses the owner on every later comparison (history_read, source
+// reads, checkpoint adoption).
+func TestDecodeSessionUsesGivenPathNotHandleName(t *testing.T) {
 	dir := t.TempDir()
-	realDir, aliasDir := filepath.Join(dir, "real"), filepath.Join(dir, "alias")
-	if err := os.Mkdir(realDir, 0700); err != nil {
+	path := filepath.Join(dir, "session.json")
+	s := newSession()
+	s.Transcript = append(s.Transcript, Message{Role: "user", Content: "recorded"})
+	if err := checkpointSession(path, s); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(realDir, aliasDir); err != nil {
+	f, err := os.Open(path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	realPath, aliasPath := filepath.Join(realDir, "new.json"), filepath.Join(aliasDir, "new.json")
-	if !sameSessionPath(realPath, aliasPath) || !sameSessionPath(aliasPath, realPath) {
-		t.Fatal("directory aliases identified a new session file as two different targets")
+	poisoned := os.NewFile(f.Fd(), `\\?\poisoned-handle-name`)
+	t.Cleanup(func() { _ = poisoned.Close() })
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if sameSessionPath(realPath, filepath.Join(aliasDir, "different.json")) {
-		t.Fatal("directory alias normalization confused different session files")
+	loaded, err := decodeSession(poisoned, absolute)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Lstat(realPath); !os.IsNotExist(err) {
-		t.Fatalf("comparing session paths created or opened a new file: %v", err)
+	if loaded.sourcePath != absolute || loaded.historyPath != absolute {
+		t.Fatalf("session paths derived from the handle name: source=%q history=%q", loaded.sourcePath, loaded.historyPath)
+	}
+}
+
+// A failed checkpoint stays fail-closed for its own file, but must not poison
+// unrelated recovery targets: a snapshot or a redirect only ever copies the
+// failed file's last committed prefix.
+func TestCheckpointFailureStaysScopedToItsFile(t *testing.T) {
+	dir := t.TempDir()
+	s, err := continueSession(filepath.Join(dir, "active.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.close)
+	s.Transcript = append(s.Transcript, Message{Role: "user", Content: "objective"})
+	if err := checkpointSession(s.saveFile, s); err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("injected checkpoint failure")
+	s.checkpointErr, s.checkpointErrPath = injected, s.saveFile
+	if err := checkpointSession(s.saveFile, s); err == nil {
+		t.Fatal("a failed file lost its fail-closed guard")
+	}
+	if result := s.editMemory("Recovered memory.", 0); !strings.Contains(result, "injected") {
+		t.Fatalf("editMemory bypassed the failed file's guard: %q", result)
+	}
+	recovery := filepath.Join(dir, "recovery.json")
+	if err := saveSession(recovery, s); err != nil {
+		t.Fatalf("stale failure poisoned an unrelated snapshot: %v", err)
+	}
+	messages, state := regressionReadSavedState(t, nil, recovery)
+	if state.Count != 2 || messages[1].Content != "objective" {
+		t.Fatalf("recovery snapshot lost the last committed state: %#v; %+v", messages, state)
+	}
+	if err := checkpointSession(filepath.Join(dir, "redirect.json"), s); err != nil {
+		t.Fatalf("stale failure poisoned redirecting checkpoints: %v", err)
 	}
 }
 
