@@ -58,7 +58,12 @@ func TestDecodeSessionUsesGivenPathNotHandleName(t *testing.T) {
 		t.Fatal(err)
 	}
 	poisoned := os.NewFile(f.Fd(), `\\?\poisoned-handle-name`)
-	t.Cleanup(func() { _ = poisoned.Close() })
+	defer func() {
+		// Both wrappers share one descriptor; close them adjacently so no
+		// orphaned finalizer can later close a reused descriptor number.
+		_ = poisoned.Close()
+		_ = f.Close()
+	}()
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		t.Fatal(err)
