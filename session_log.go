@@ -216,7 +216,7 @@ func readSessionDoc(f *os.File, start, size int64, prefix sessionLogState, visit
 	members, lastKey := 0, -1
 	seenVersion, seenState := false, false
 	var memberEnd int64
-	for d.More() {
+	for d.InputOffset() < size-start && d.More() {
 		keyToken, err := d.Token()
 		if err != nil {
 			if err := docReadErr(err); err != nil {
@@ -321,14 +321,19 @@ func readSessionDoc(f *os.File, start, size int64, prefix sessionLogState, visit
 			return state, fmt.Errorf("unknown session document field %q", key)
 		}
 	}
-	if closing, err := d.Token(); err != nil {
-		if err := docReadErr(err); err != nil {
-			return state, fmt.Errorf("invalid session document: %w", err)
+	// Snapshot copying intentionally stops at the last committed member,
+	// before the closing brace. Do not ask the decoder for another token
+	// once that explicit boundary has been reached.
+	if d.InputOffset() < size-start {
+		if closing, err := d.Token(); err != nil {
+			if err := docReadErr(err); err != nil {
+				return state, fmt.Errorf("invalid session document: %w", err)
+			}
+		} else if closing != json.Delim('}') {
+			return state, errors.New("invalid session document")
+		} else if _, err := d.Token(); err == nil || !errors.Is(err, io.EOF) {
+			return state, errors.New("trailing data in session document")
 		}
-	} else if closing != json.Delim('}') {
-		return state, errors.New("invalid session document")
-	} else if _, err := d.Token(); err == nil || !errors.Is(err, io.EOF) {
-		return state, errors.New("trailing data in session document")
 	}
 	if members > 0 {
 		if err := v.finish(); err != nil {
