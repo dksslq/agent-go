@@ -157,15 +157,28 @@ func TestStreamIdleTimeoutHeadersAndBody(t *testing.T) {
 }
 
 func TestStreamIdleTimeoutTracksBytesAndCanBeDisabled(t *testing.T) {
-	for _, timeout := range []time.Duration{0, 150 * time.Millisecond} {
+	for _, timeout := range []time.Duration{0, 2 * time.Second} {
 		t.Run(timeout.String(), func(t *testing.T) {
 			withStreamDefaults(t)
 			streamIdleTimeout = timeout
-			withSSEServer(t, func(w http.ResponseWriter, _ *http.Request) {
-				for i := 0; i < 5; i++ {
+			withSSEServer(t, func(w http.ResponseWriter, r *http.Request) {
+				// Keep the stream alive longer than the idle timeout, with enough
+				// scheduling headroom for race-instrumented CI runners.
+				duration := 250 * time.Millisecond
+				if timeout > 0 {
+					duration = timeout + time.Second
+				}
+				ticker := time.NewTicker(20 * time.Millisecond)
+				defer ticker.Stop()
+				until := time.Now().Add(duration)
+				for time.Now().Before(until) {
 					io.WriteString(w, ": heartbeat\n\n")
 					w.(http.Flusher).Flush()
-					time.Sleep(50 * time.Millisecond)
+					select {
+					case <-ticker.C:
+					case <-r.Context().Done():
+						return
+					}
 				}
 				io.WriteString(w, deltaChunk(t, map[string]interface{}{contentField: "alive"}, "")+sseData("[DONE]"))
 			})
