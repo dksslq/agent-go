@@ -453,10 +453,25 @@ func (s *Session) checkpointFromLocked(path, memory string, cursor, limit int, s
 			if _, err := owner.file.Seek(0, io.SeekStart); err != nil {
 				return err
 			}
-			if _, err := io.CopyN(owner.file, io.NewSectionReader(source, 0, s.diskOffset), s.diskOffset); err != nil {
+			// Normalize snapshots to one document, including legacy archives.
+			// Stream messages so Save As does not retain the archive in RAM.
+			separator := "{"
+			if _, err := readSessionLogPrefix(source, s.diskOffset, func(index int, m Message) error {
+				data, err := json.Marshal(m)
+				if err != nil {
+					return err
+				}
+				_, err = fmt.Fprintf(owner.file, "%s\n  \"m%d\": %s", separator, index, data)
+				separator = ","
+				return err
+			}); err != nil {
 				return err
 			}
-			docOpen = s.diskDocOpen
+			offset, err = owner.file.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return err
+			}
+			docOpen = true
 		} else {
 			base, count, offset, docOpen = s.archived, 0, 0, false
 		}

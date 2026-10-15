@@ -80,7 +80,12 @@ func readSessionLog(f *os.File, visit func(int, Message) error) (sessionLogState
 	if !info.Mode().IsRegular() {
 		return state, errors.New("session must be a regular file")
 	}
-	size := info.Size()
+	return readSessionLogPrefix(f, info.Size(), visit)
+}
+
+// Read only the committed prefix when copying a session to a new snapshot.
+func readSessionLogPrefix(f *os.File, size int64, visit func(int, Message) error) (sessionLogState, error) {
+	var state sessionLogState
 	reader := bufio.NewReader(io.NewSectionReader(f, 0, size))
 	var start int64
 	var leading byte
@@ -251,6 +256,11 @@ func readSessionDoc(f *os.File, start, size int64, prefix sessionLogState, visit
 			if lastKey >= 0 {
 				count = lastKey + 1
 			}
+			if fresh && members == 1 {
+				// Only m0 remains after full compaction; there is no suffix
+				// index from which to infer the archived message count.
+				count = st.Base + 1
+			}
 			if st.Base < 0 || st.Cursor <= st.Base || st.Cursor > count {
 				return state, errors.New("session state cursor outside its history")
 			}
@@ -324,7 +334,7 @@ func readSessionDoc(f *os.File, start, size int64, prefix sessionLogState, visit
 		if err := v.finish(); err != nil {
 			return state, err
 		}
-		state.Count = lastKey + 1
+		state.Count = max(lastKey+1, base+1)
 		state.Base = base
 		state.Offset = start + memberEnd
 		state.DocOpen = true
