@@ -25,10 +25,7 @@ func TestCLI(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		bin += ".exe"
 	}
-	build := exec.Command("go", "build", "-race", "-o", bin, ".")
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build real CLI: %v\n%s", err, output)
-	}
+	buildCoveredCLI(t, bin)
 	command := func(t *testing.T, base string, args ...string) (*exec.Cmd, *bytes.Buffer, *bytes.Buffer) {
 		t.Helper()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -48,6 +45,58 @@ func TestCLI(t *testing.T) {
 		}
 		return -1
 	}
+	t.Run("invalid options fail before network", func(t *testing.T) {
+		cases := [][]string{
+			{"-extra", "not-base64"}, {"-extra", "W10="},
+			{"-api-base", "ftp://localhost"}, {"-api-base", "http://localhost/?query=1"},
+			{"-stream-idle-timeout", "-1s"}, {"-http-idle-timeout", "-1s"},
+			{"-http-max-idle-conns", "-1"}, {"-unknown-option"}, {"-pipe"},
+		}
+		for _, args := range cases {
+			cmd, out, errout := command(t, "http://127.0.0.1:1", args...)
+			if code := exit(cmd.Run()); code != 1 || out.Len() != 0 || errout.Len() == 0 {
+				t.Fatalf("args=%v code=%d stdout=%q stderr=%q", args, code, out, errout)
+			}
+		}
+	})
+	t.Run("media commands and memory inspection are local", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "image.png")
+		if err := os.WriteFile(path, append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 16)...), 0600); err != nil {
+			t.Fatal(err)
+		}
+		s := newSession()
+		s.Memory = "retained notes"
+		snapshot := filepath.Join(dir, "memory.json")
+		if err := saveSession(snapshot, s); err != nil {
+			t.Fatal(err)
+		}
+		s.close()
+		cmd, out, errout := command(t, "http://127.0.0.1:1")
+		cmd.Stdin = strings.NewReader("/pending\n/memory\n/image\n/image-url\n/save\n/load\n/continue\n/image missing-image\n/image " + path + "\n/image-url https://example.invalid/" + strings.Repeat("x", 100) + "\n/pending\n/clear\n/pending\n/load " + snapshot + "\n/memory\n\nquit\n")
+		if code := exit(cmd.Run()); code != 0 {
+			t.Fatalf("code=%d stderr=%q", code, errout)
+		}
+		for _, want := range []string{"No pending media.", "Memory: (empty)", "Usage:", "Image error:", "Pending images: 2", "Pending media cleared.", "retained notes"} {
+			if !strings.Contains(out.String(), want) {
+				t.Fatalf("missing %q: %s", want, out)
+			}
+		}
+	})
+	t.Run("stdin read failures return failure", func(t *testing.T) {
+		f, err := os.OpenFile(filepath.Join(t.TempDir(), "write-only"), os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		for _, args := range [][]string{nil, {"-pipe"}} {
+			cmd, _, errout := command(t, "http://127.0.0.1:1", args...)
+			cmd.Stdin = f
+			if code := exit(cmd.Run()); code != 1 || !strings.Contains(strings.ToLower(errout.String()), "input") && !strings.Contains(errout.String(), "stdin") {
+				t.Fatalf("code=%d stderr=%q", code, errout)
+			}
+		}
+	})
 	t.Run("extra preserves exact JSON numbers", func(t *testing.T) {
 		const extra = `{"seed":9007199254740993,"nested":{"id":9223372036854775807,"fraction":0.12345678901234567890123456789},"temperature":0.1}`
 		requests := make(chan map[string]json.RawMessage, 1)

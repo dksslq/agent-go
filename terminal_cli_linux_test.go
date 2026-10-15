@@ -21,9 +21,7 @@ import (
 
 func TestCLIMultilinePaste(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "agent")
-	if out, err := exec.Command("go", "build", "-race", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v %s", err, out)
-	}
+	buildCoveredCLI(t, bin)
 	requests := make(chan ChatRequest, 4)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var q ChatRequest

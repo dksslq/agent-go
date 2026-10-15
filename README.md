@@ -178,9 +178,9 @@ go test -count=1 -race -shuffle=on -covermode=atomic ./...
 
 CI 在 Linux 的 Go 1.21 与 stable、macOS stable、Windows stable 上运行检查与竞态测试，并交叉编译 Linux / macOS / Windows × amd64 / arm64。测试使用标准库 `testing`、`httptest` 和真实子进程；Linux 还使用 PTY 验证行输入。发布工作流由 `v*` 标签触发，构建平台二进制与 Debian 包。
 
-代码按职责拆分：`cli.go` 处理入口与信号，`agent.go` 处理推理与工具，`openai.go` 处理 API / SSE，`memory.go` 处理会话与增量日志，`exec_output.go` 处理输出捕获，`output.go` 处理可取消的标准输出，`exec_*.go` / `term_*.go` / `session_*.go` 提供平台适配。它们构建为同一个可执行文件。
+代码按职责拆分：`cli.go` 处理入口与信号，`agent.go` 处理推理与工具，`openai.go` 处理 API / SSE，`memory.go` 处理记忆与会话操作，`session_log.go` 处理会话文档读写，`history.go` 处理历史回溯，`exec_output.go` 处理输出捕获，`output.go` 处理可取消的标准输出，`exec_*.go` / `term_*.go` / `session_*.go` 提供平台适配。它们构建为同一个可执行文件。
 
-历史变更见 [CHANGES.md](CHANGES.md)。轮次取消与参数保真修复见 [v2.4.2](docs/release-v2.4.2.md)。本次协议修复与保存语义见 [v2.4.0](docs/release-v2.4.0.md)；此前的运行时、终端、工具输出与持久化审计分别见 [v2.1.0](docs/release-v2.1.0.md)、[v2.1.1](docs/release-v2.1.1.md)、[v2.1.2](docs/release-v2.1.2.md)、[v2.1.3](docs/release-v2.1.3.md)、[v2.2.0](docs/release-v2.2.0.md)、[v2.3.0](docs/release-v2.3.0.md)。
+测试布局、完整验证命令与 CLI 子进程覆盖率统计见 [测试说明](docs/testing.md)。发布说明入口见 [文档索引](docs/README.md)，按版本汇总的历史变更见 [CHANGES.md](CHANGES.md)。
 
 ## 许可与署名
 
