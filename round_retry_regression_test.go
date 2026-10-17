@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -33,6 +34,17 @@ func TestMalformedToolCallRetriesInsteadOfStopping(t *testing.T) {
 		}
 		if strings.Contains(body.String(), "[Turn aborted: tool call") {
 			atomic.StoreInt32(&sawMarker, 1)
+			// DeepSeek rejects a thinking-mode request whose tail is an
+			// assistant message without reasoning_content; the abort
+			// feedback must therefore ride on a user message.
+			var req struct {
+				Messages []Message `json:"messages"`
+			}
+			if err := json.Unmarshal([]byte(body.String()), &req); err != nil {
+				t.Errorf("bad retry request: %v", err)
+			} else if n := len(req.Messages); n > 0 && req.Messages[n-1].Role == "assistant" {
+				t.Errorf("retry request tail is an assistant message: %+v", req.Messages[n-1])
+			}
 		}
 		if n == 1 {
 			// Exactly the reported shape: tool call whose streamed arguments
@@ -42,7 +54,8 @@ func TestMalformedToolCallRetriesInsteadOfStopping(t *testing.T) {
 			fmt.Fprint(w, "data: [DONE]\n\n")
 			return
 		}
-		fmt.Fprint(w, deltaChunk(t, map[string]interface{}{contentField: "recovered and completed"}, "stop"))
+		fmt.Fprint(w, deltaChunk(t, map[string]interface{}{reasoningField: "thought", contentField: "recovered"}, ""))
+		fmt.Fprint(w, deltaChunk(t, map[string]interface{}{reasoningField: " then ", contentField: " and completed"}, "stop"))
 		fmt.Fprint(w, "data: [DONE]\n\n")
 		fmt.Fprint(w, "data: [DONE]\n\n")
 	})
@@ -55,16 +68,27 @@ func TestMalformedToolCallRetriesInsteadOfStopping(t *testing.T) {
 	if atomic.LoadInt32(&sawMarker) != 1 {
 		t.Fatalf("retry request did not include the abort marker feedback")
 	}
-	var all strings.Builder
+	var feedback, answers, reasoning strings.Builder
 	for _, m := range s.Transcript {
-		if m.Role == "assistant" {
-			if c, ok := m.Content.(string); ok {
-				all.WriteString(c)
-				all.WriteString("\n")
+		if c, ok := m.Content.(string); ok {
+			switch m.Role {
+			case "user":
+				feedback.WriteString(c)
+				feedback.WriteString("\n")
+			case "assistant":
+				answers.WriteString(c)
+				answers.WriteString("\n")
+				reasoning.WriteString(m.ReasoningContent)
 			}
 		}
 	}
-	if !strings.Contains(all.String(), "[Turn aborted: tool call") || !strings.Contains(all.String(), "recovered and completed") {
-		t.Fatalf("transcript missing abort marker or final answer: %q", all.String())
+	if !strings.Contains(feedback.String(), "[Turn aborted: tool call") {
+		t.Fatalf("transcript missing user-role abort marker feedback: %q", feedback.String())
+	}
+	if !strings.Contains(answers.String(), "recovered and completed") {
+		t.Fatalf("transcript missing final answer: %q", answers.String())
+	}
+	if reasoning.String() != "thought then " {
+		t.Fatalf("assistant messages must carry back the streamed reasoning, got %q", reasoning.String())
 	}
 }

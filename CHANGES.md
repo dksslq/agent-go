@@ -1,5 +1,10 @@
 # agent-go 变更
 
+## v2.5.3 — 思维链传回与中止反馈角色（2026-10-17）
+
+- 修复 DeepSeek thinking 模式 + 工具调用下的 400 `reasoning_content must be passed back`：流式收集的 `reasoning_content` 现随 assistant 消息保存（含会话文档）并在后续请求传回；非思维链 provider 不输出该字段，请求字节不变。
+- 中止反馈（`[Turn aborted: …]` / `[Interrupted by user]`）从合成的 assistant 消息改为 **user 消息**：thinking 模式 API 拒绝以无 `reasoning_content` 的 assistant 消息结尾的请求（用户实测 64 轮后触发）；标记文本与语义不变。
+- 新增回归测试：中止反馈角色与重试请求尾部形态（不允许 assistant 结尾）、思维链流式收集/持久化/恢复/传回全链路、mock e2e 复现用户的完整场景链（正常工具轮→畸形调用→自愈）。
 当前使用语义见 [README](README.md)，测试方法见 [测试说明](docs/testing.md)。以下已发布版本记录描述当时行为，后续版本可能调整。
 
 ## 未发布

@@ -588,7 +588,11 @@ func recordTurnAbort(sess *Session, content, marker string) {
 	if content != "" {
 		content += "\n\n"
 	}
-	sess.Transcript = append(sess.Transcript, Message{Role: "assistant", Content: content + marker})
+	// User-role feedback: a synthetic assistant message carries no
+	// reasoning_content, and thinking-mode APIs with tools reject a request
+	// whose tail is such a message (DeepSeek 400 "reasoning_content must be
+	// passed back"). The marker text itself is unchanged.
+	sess.Transcript = append(sess.Transcript, Message{Role: "user", Content: content + marker})
 }
 
 var errCheckpoint = errors.New("checkpoint failed")
@@ -610,6 +614,7 @@ func runInferenceLoop(ctx context.Context, sess *Session) error {
 			return err
 		}
 		var content strings.Builder
+		var reasoning strings.Builder
 		var calls []ToolCall
 		var streamErr error
 	loop:
@@ -622,6 +627,7 @@ func runInferenceLoop(ctx context.Context, sess *Session) error {
 				}
 				switch e.Type {
 				case EventReasoning:
+					reasoning.WriteString(e.Text)
 					if verbose || termRaw {
 						if err := infofContext(ctx, "%s", e.Text); err != nil {
 							streamErr = err
@@ -672,7 +678,7 @@ func runInferenceLoop(ctx context.Context, sess *Session) error {
 				}
 				return err
 			}
-			sess.Transcript = append(sess.Transcript, Message{Role: "assistant", Content: content.String()})
+			sess.Transcript = append(sess.Transcript, Message{Role: "assistant", Content: content.String(), ReasoningContent: reasoning.String()})
 			if err := putContext(ctx, "\n"); err != nil {
 				return fmt.Errorf("write stdout: %w", err)
 			}
@@ -681,7 +687,7 @@ func runInferenceLoop(ctx context.Context, sess *Session) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		assistant := Message{Role: "assistant", ToolCalls: calls}
+		assistant := Message{Role: "assistant", ToolCalls: calls, ReasoningContent: reasoning.String()}
 		if content.Len() > 0 {
 			assistant.Content = content.String()
 		}

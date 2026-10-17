@@ -547,7 +547,7 @@ func TestCLI(t *testing.T) {
 			if err == nil && saved != nil {
 				last := saved.Transcript[len(saved.Transcript)-1]
 				text, _ := last.Content.(string)
-				aborted = last.Role == "assistant" && strings.Contains(text, interruptedMarker)
+				aborted = last.Role == "user" && strings.Contains(text, interruptedMarker)
 				saved.close()
 			}
 			if aborted {

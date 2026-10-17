@@ -84,6 +84,10 @@ type Message struct {
 	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
 	ToolCallID string      `json:"tool_call_id,omitempty"`
 	Name       string      `json:"name,omitempty"`
+	// ReasoningContent carries this assistant turn's chain of thought.
+	// Thinking-mode APIs with tools require it to be passed back (DeepSeek
+	// returns 400 otherwise); providers that never emit it never see it.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type ToolCall struct {
